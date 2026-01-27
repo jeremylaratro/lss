@@ -22,6 +22,8 @@
 
 Security Suite Control Panel is a comprehensive desktop application that integrates **Intrusion Detection Systems (Suricata/Snort)**, **ClamAV Antivirus**, **Firewall Management**, and **Threat Intelligence** into a single, intuitive interface. Monitor your network traffic, detect threats, and harden your system—all from one dashboard.
 
+**Only tested on Fedora so far**
+
 ### Key Highlights
 
 - **Real-time Network Monitoring** — Track HTTP, DNS, TLS, and SSH traffic with live activity feeds

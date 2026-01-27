@@ -32,6 +32,13 @@ Security Suite Control Panel is a comprehensive desktop application that integra
 - **Threat Intelligence** — Automatic IP/domain enrichment via VirusTotal, AbuseIPDB, AlienVault OTX, and ThreatFox
 - **Security Auditing** — System hardening checks with actionable recommendations
 - **Modern UI** — Dark-themed interface with tabbed navigation and real-time updates
+- **Polybar Integration** — Desktop widget showing IDS status and alert counts
+
+<p align="center">
+  <img src="marketing/2026-01-26_22-53.png" alt="Polybar Widget">
+  <br>
+  <em>Polybar widget for at-a-glance IDS monitoring</em>
+</p>
 
 ---
 

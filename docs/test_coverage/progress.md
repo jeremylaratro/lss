@@ -7,11 +7,12 @@
 
 | Metric | Value |
 |--------|-------|
-| Total Tests | 853 |
-| Overall Coverage | 25% |
+| Total Tests | 936 |
+| Overall Coverage | 26% |
 | Backend Coverage | ~95% |
 | UI Component Coverage | ~95% |
 | Heavy UI Coverage | ~5% |
+| Cross-OS Coverage | 97% |
 
 ---
 
@@ -141,6 +142,7 @@ Added comprehensive business logic test classes with docstrings explaining WHY e
 | 27 JAN 2026 | 680 | 680 | 0 | 21% |
 | 27 JAN 2026 | 813 | 813 | 0 | 25% |
 | 27 JAN 2026 | 853 | 853 | 0 | 25% |
+| 27 JAN 2026 | 936 | 936 | 0 | 26% |
 
 ---
 
@@ -165,3 +167,79 @@ Added comprehensive business logic test classes with docstrings explaining WHY e
 
 Note: Heavy UI modules require a display server and extensive mocking.
 The testable UI components (factories, builders, base classes) achieve 95%+ coverage.
+
+---
+
+## Phase 4: Cross-OS Compatibility - COMPLETED
+
+### core/utils.py (0% → 97%)
+Created comprehensive OS detection utility for distro-specific paths/services.
+
+**New Components:**
+- `LinuxDistro` enum (FEDORA, DEBIAN, ARCH, UNKNOWN)
+- `DistroConfig` dataclass with all distro-specific settings
+- `detect_distro()` - reads /etc/os-release
+- `get_distro_config()` - returns appropriate config
+- `get_system_config()` - cached singleton
+- `is_private_ip()` - filter private IPs from threat intel
+
+**Test Coverage (test_cross_os.py - 49 tests):**
+- [x] TestDistroDetection (8 tests) - Fedora, Debian, Ubuntu, Arch, Manjaro, Rocky, unknown
+- [x] TestClamAVServiceNames (3 tests) - clamd@scan vs clamav-daemon
+- [x] TestClamAVSocketPaths (4 tests) - different socket locations per distro
+- [x] TestClamAVUser (3 tests) - clamupdate vs clamav user/group
+- [x] TestFirewallDetection (4 tests) - firewalld vs ufw
+- [x] TestAdminGroup (3 tests) - wheel vs sudo
+- [x] TestDistroConfigIntegration (3 tests) - complete config per distro
+- [x] TestCachedConfig (1 test) - singleton pattern
+- [x] TestCrossOSCommandGeneration (3 tests) - verify generated commands are valid
+- [x] TestPrivateIPDetection (16 tests) - IPv4/IPv6 private ranges
+
+**Status:** COMPLETED (49 tests added)
+
+---
+
+## Phase 5: UI Tab Business Logic - COMPLETED
+
+### Extracted and tested core algorithms from UI tabs (test_ui_tab_logic.py - 34 tests)
+
+**AlertsTab Logic:**
+- [x] TestAlertTimestampFormatting (4 tests) - today vs older date display
+- [x] TestIntelStatusCombination (5 tests) - DANGER > suspect > error > checking > safe
+- [x] TestAlertFiltering (6 tests) - signature, IP, category filtering with AND logic
+- [x] TestAlertGrouping (6 tests) - "ET MALWARE x47" style grouping
+
+**DNSTab Logic:**
+- [x] TestDNSGrouping (2 tests) - group queries by domain
+
+**TrafficTab Logic:**
+- [x] TestTrafficGrouping (2 tests) - group flows by destination
+
+**Common Logic:**
+- [x] TestSortStateManagement (2 tests) - column toggle behavior
+- [x] TestDataTruncation (3 tests) - long URL handling
+- [x] TestFileSizeFormatting (4 tests) - bytes to human-readable
+
+**Status:** COMPLETED (34 tests added)
+
+---
+
+## Distro Compatibility Matrix
+
+| Feature | Fedora | Debian/Ubuntu | Arch |
+|---------|--------|---------------|------|
+| **ClamAV Service** | clamd@scan | clamav-daemon | clamav-daemon |
+| **ClamAV Freshclam** | clamav-freshclam | clamav-freshclam | clamav-freshclam |
+| **ClamAV User** | clamupdate | clamav | clamav |
+| **ClamAV Group** | clamupdate | clamav | clamav |
+| **ClamAV Socket** | /var/run/clamd.scan/clamd.sock | /var/run/clamav/clamd.ctl | /run/clamav/clamd.sock |
+| **ClamAV Config** | /etc/clamd.d | /etc/clamav | /etc/clamav |
+| **Firewall** | firewalld | ufw | ufw |
+| **Admin Group** | wheel | sudo | wheel |
+| **Detection Method** | /etc/os-release | /etc/os-release | /etc/os-release |
+
+### Runtime Detection Notes
+- Socket paths are verified at runtime (first existing path wins)
+- User/group detected via pwd/grp modules (not assumed)
+- Firewall detected via binary existence checks
+- Admin group detected via grp.getgrnam() probing

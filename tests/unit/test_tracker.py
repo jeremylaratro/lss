@@ -380,3 +380,368 @@ class TestIPLookupTrackerGetStats:
         stats = tracker.get_stats()
         assert stats['active'] == 1
         assert stats['dangerous'] == 0
+
+
+class TestTrackerBusinessLogic:
+    """
+    Test real-world business logic for IP lookup tracking.
+
+    These tests verify the tracker behaves correctly in actual
+    security monitoring scenarios, not just basic functionality.
+    """
+
+    # --- API Rate Limiting Protection ---
+
+    def test_prevents_duplicate_api_calls(self):
+        """
+        BUSINESS LOGIC: Prevent burning API credits on duplicate lookups.
+
+        AbuseIPDB/VirusTotal have daily limits. Looking up same IP
+        repeatedly would waste quota. Window-based caching prevents this.
+        """
+        with patch.object(Path, 'exists', return_value=False):
+            tracker = IPLookupTracker(window_hours=12)
+
+        # First lookup should be allowed (fresh tracker with no history)
+        assert tracker.should_lookup("185.234.123.45") is True
+
+        # Record the lookup (mock save to avoid file ops)
+        with patch.object(tracker, '_save'):
+            tracker.record_lookup("185.234.123.45", "DANGER", "AbuseIPDB")
+
+        # Second lookup within window should be blocked
+        assert tracker.should_lookup("185.234.123.45") is False
+
+        # Different IP should still be allowed
+        assert tracker.should_lookup("185.234.123.46") is True
+
+    def test_window_expiration_allows_fresh_lookup(self):
+        """
+        BUSINESS LOGIC: After window expires, allow fresh lookup.
+
+        Threat intel changes over time. An IP safe yesterday might
+        be compromised today. Window expiration enables re-checking.
+        """
+        tracker = IPLookupTracker(window_hours=1)  # Short window for testing
+
+        # Simulate lookup from 2 hours ago
+        old_time = (datetime.now() - timedelta(hours=2)).isoformat()
+        tracker.lookups = {
+            '8.8.8.8': {
+                'timestamp': old_time,
+                'result': 'safe',
+                'source': 'AbuseIPDB',
+                'details': {}
+            }
+        }
+
+        # Expired lookup should allow re-lookup
+        assert tracker.should_lookup("8.8.8.8") is True
+
+        # And the old entry should be removed
+        assert '8.8.8.8' not in tracker.lookups
+
+    # --- Private IP Protection ---
+
+    def test_never_sends_private_ips_to_apis(self):
+        """
+        BUSINESS LOGIC: Private IPs must NEVER be sent to threat intel APIs.
+
+        1. Privacy: Reveals internal network structure
+        2. Useless: Private IPs have no threat intel value
+        3. Rate limit: Would waste API quota on meaningless lookups
+        """
+        tracker = IPLookupTracker()
+
+        # RFC1918 private ranges
+        assert tracker.should_lookup("10.0.0.1") is False
+        assert tracker.should_lookup("10.255.255.255") is False
+        assert tracker.should_lookup("172.16.0.1") is False
+        assert tracker.should_lookup("172.31.255.255") is False
+        assert tracker.should_lookup("192.168.0.1") is False
+        assert tracker.should_lookup("192.168.255.255") is False
+
+        # Loopback
+        assert tracker.should_lookup("127.0.0.1") is False
+        assert tracker.should_lookup("127.255.255.255") is False
+
+        # Link-local
+        assert tracker.should_lookup("169.254.1.1") is False
+
+        # But public IPs should be allowed
+        assert tracker.should_lookup("8.8.8.8") is True
+        assert tracker.should_lookup("1.1.1.1") is True
+
+    # --- Threat Classification ---
+
+    def test_threat_levels_for_dashboard_display(self):
+        """
+        BUSINESS LOGIC: Stats categorize threats for dashboard summary.
+
+        Dashboard shows: "5 active lookups (2 DANGER, 1 suspect)"
+        Correct categorization is critical for security awareness.
+        """
+        tracker = IPLookupTracker()
+        now = datetime.now().isoformat()
+
+        tracker.lookups = {
+            '1.1.1.1': {'timestamp': now, 'result': 'safe', 'source': 'Test'},
+            '2.2.2.2': {'timestamp': now, 'result': 'safe', 'source': 'Test'},
+            '3.3.3.3': {'timestamp': now, 'result': 'suspect', 'source': 'Test'},
+            '4.4.4.4': {'timestamp': now, 'result': 'DANGER', 'source': 'Test'},
+            '5.5.5.5': {'timestamp': now, 'result': 'DANGER', 'source': 'Test'},
+        }
+
+        stats = tracker.get_stats()
+
+        assert stats['active'] == 5
+        assert stats['dangerous'] == 2
+        assert stats['suspect'] == 1
+        # 'safe' not tracked separately (active - dangerous - suspect = safe)
+
+    def test_result_status_case_sensitivity(self):
+        """
+        BUSINESS LOGIC: Result status matching is CASE SENSITIVE.
+
+        'DANGER' != 'danger' - must use exact strings from API normalization.
+        Inconsistent casing would cause incorrect threat counts.
+        """
+        tracker = IPLookupTracker()
+        now = datetime.now().isoformat()
+
+        tracker.lookups = {
+            '1.1.1.1': {'timestamp': now, 'result': 'DANGER', 'source': 'Test'},
+            '2.2.2.2': {'timestamp': now, 'result': 'danger', 'source': 'Test'},  # Wrong case
+            '3.3.3.3': {'timestamp': now, 'result': 'Danger', 'source': 'Test'},  # Wrong case
+        }
+
+        stats = tracker.get_stats()
+
+        # Only exact 'DANGER' match counts
+        assert stats['dangerous'] == 1
+
+    # --- Data Persistence ---
+
+    def test_lookup_survives_restart(self):
+        """
+        BUSINESS LOGIC: Lookups must persist across application restarts.
+
+        User closes app, reopens next day - recent lookups should
+        still be cached to avoid re-querying APIs.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracker_file = Path(tmpdir) / "lookups.json"
+
+            # First session: record a lookup
+            with patch.object(IPLookupTracker, 'TRACKER_FILE', tracker_file):
+                tracker1 = IPLookupTracker()
+                tracker1.record_lookup(
+                    "185.234.123.45",
+                    "DANGER",
+                    "AbuseIPDB",
+                    {'abuse_confidence_score': 95}
+                )
+
+            # Second session: lookup should still be cached
+            with patch.object(IPLookupTracker, 'TRACKER_FILE', tracker_file):
+                tracker2 = IPLookupTracker()
+                assert tracker2.should_lookup("185.234.123.45") is False
+                assert tracker2.get_result("185.234.123.45") == "DANGER"
+
+    def test_corrupted_file_recovery(self):
+        """
+        BUSINESS LOGIC: Corrupted tracker file shouldn't crash the app.
+
+        File could be corrupted by crash, disk error, manual edit.
+        App must start fresh rather than crashing.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracker_file = Path(tmpdir) / "lookups.json"
+
+            # Create corrupted file
+            with open(tracker_file, 'w') as f:
+                f.write("{invalid json[[[")
+
+            # Should start with empty lookups, not crash
+            with patch.object(IPLookupTracker, 'TRACKER_FILE', tracker_file):
+                tracker = IPLookupTracker()
+                assert tracker.lookups == {}
+
+                # Should still be functional
+                assert tracker.should_lookup("8.8.8.8") is True
+
+    # --- Sorting and Display ---
+
+    def test_recent_lookups_shown_first(self):
+        """
+        BUSINESS LOGIC: Most recent lookups appear at top of Intel tab.
+
+        Users want to see latest threat intel first, not scroll through
+        hours of old lookups to find recent activity.
+        """
+        tracker = IPLookupTracker()
+
+        # Create lookups at different times
+        time_3h_ago = (datetime.now() - timedelta(hours=3)).isoformat()
+        time_2h_ago = (datetime.now() - timedelta(hours=2)).isoformat()
+        time_1h_ago = (datetime.now() - timedelta(hours=1)).isoformat()
+        time_now = datetime.now().isoformat()
+
+        tracker.lookups = {
+            '1.1.1.1': {'timestamp': time_3h_ago, 'result': 'safe', 'source': 'A'},
+            '2.2.2.2': {'timestamp': time_1h_ago, 'result': 'safe', 'source': 'B'},
+            '3.3.3.3': {'timestamp': time_now, 'result': 'DANGER', 'source': 'C'},
+            '4.4.4.4': {'timestamp': time_2h_ago, 'result': 'suspect', 'source': 'D'},
+        }
+
+        results = tracker.get_all_lookups()
+
+        # Should be sorted newest first
+        assert results[0]['ip'] == '3.3.3.3'  # Most recent
+        assert results[1]['ip'] == '2.2.2.2'
+        assert results[2]['ip'] == '4.4.4.4'
+        assert results[3]['ip'] == '1.1.1.1'  # Oldest
+
+    def test_full_lookup_info_available_for_display(self):
+        """
+        BUSINESS LOGIC: All API response details must be preserved.
+
+        Intel tab shows: IP, timestamp, result, source, AND detailed
+        info like abuse score, country, ISP from API response.
+        """
+        tracker = IPLookupTracker()
+
+        api_details = {
+            'abuseConfidenceScore': 95,
+            'countryCode': 'RU',
+            'isp': 'Evil Corp ISP',
+            'domain': 'evil.com',
+            'totalReports': 1234,
+            'lastReportedAt': '2024-01-15T10:00:00'
+        }
+
+        tracker.record_lookup(
+            "185.234.123.45",
+            "DANGER",
+            "AbuseIPDB",
+            api_details
+        )
+
+        info = tracker.get_lookup_info("185.234.123.45")
+
+        # All details preserved
+        assert info['details']['abuseConfidenceScore'] == 95
+        assert info['details']['countryCode'] == 'RU'
+        assert info['details']['isp'] == 'Evil Corp ISP'
+        assert info['details']['totalReports'] == 1234
+
+    # --- Edge Cases ---
+
+    def test_rapid_consecutive_lookups_same_ip(self):
+        """
+        BUSINESS LOGIC: Rapid clicks shouldn't cause multiple API calls.
+
+        User double-clicks "Lookup" button - only one API call should happen.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracker_file = Path(tmpdir) / "lookups.json"
+            with patch.object(IPLookupTracker, 'TRACKER_FILE', tracker_file):
+                tracker = IPLookupTracker()
+
+                # First check allows lookup
+                assert tracker.should_lookup("8.8.8.8") is True
+
+                # Record immediately
+                tracker.record_lookup("8.8.8.8", "safe", "Test")
+
+                # Immediate second check should be blocked
+                assert tracker.should_lookup("8.8.8.8") is False
+
+                # Even after a millisecond delay
+                import time
+                time.sleep(0.001)
+                assert tracker.should_lookup("8.8.8.8") is False
+
+    def test_overwrite_existing_lookup_updates_timestamp(self):
+        """
+        BUSINESS LOGIC: Re-lookup after expiration updates the entry.
+
+        If IP was looked up yesterday, re-lookup today should
+        replace old data with fresh data, not append.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracker_file = Path(tmpdir) / "lookups.json"
+            with patch.object(IPLookupTracker, 'TRACKER_FILE', tracker_file):
+                tracker = IPLookupTracker()
+
+                # First lookup says 'safe'
+                old_time = (datetime.now() - timedelta(hours=1)).isoformat()
+                tracker.lookups = {
+                    '8.8.8.8': {
+                        'timestamp': old_time,
+                        'result': 'safe',
+                        'source': 'OldSource',
+                        'details': {'old': 'data'}
+                    }
+                }
+
+                # Re-lookup says 'suspect'
+                tracker.record_lookup("8.8.8.8", "suspect", "NewSource", {'new': 'data'})
+
+                # Should have new data, not old
+                info = tracker.get_lookup_info("8.8.8.8")
+                assert info['result'] == 'suspect'
+                assert info['source'] == 'NewSource'
+                assert info['details'] == {'new': 'data'}
+
+                # Only one entry for this IP
+                assert len([k for k in tracker.lookups if k == '8.8.8.8']) == 1
+
+    def test_empty_details_doesnt_crash(self):
+        """
+        BUSINESS LOGIC: Missing details field shouldn't crash display.
+
+        Older lookups might not have details field.
+        get_all_lookups() must handle gracefully.
+        """
+        tracker = IPLookupTracker()
+        now = datetime.now().isoformat()
+
+        # Entry without details field (legacy data)
+        tracker.lookups = {
+            '8.8.8.8': {
+                'timestamp': now,
+                'result': 'safe',
+                'source': 'Test'
+                # No 'details' key
+            }
+        }
+
+        results = tracker.get_all_lookups()
+
+        # Should not crash, should have empty details
+        assert len(results) == 1
+        assert results[0]['details'] == {}
+
+    def test_missing_source_uses_unknown(self):
+        """
+        BUSINESS LOGIC: Missing source field shows 'Unknown'.
+
+        Older lookups might not have source field.
+        UI should show something rather than crash.
+        """
+        tracker = IPLookupTracker()
+        now = datetime.now().isoformat()
+
+        # Entry without source field (legacy data)
+        tracker.lookups = {
+            '8.8.8.8': {
+                'timestamp': now,
+                'result': 'safe'
+                # No 'source' key
+            }
+        }
+
+        results = tracker.get_all_lookups()
+
+        assert results[0]['source'] == 'Unknown'

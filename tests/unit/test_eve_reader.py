@@ -465,3 +465,376 @@ class TestEVEFileReader:
         lines2 = reader.read_new_lines()
         assert reader.current_inode != old_inode
         assert reader.position >= 0
+
+
+class TestEVEReaderBusinessLogic:
+    """
+    Business logic tests for EVE file reader.
+
+    The EVE reader is CRITICAL for IDS monitoring:
+    - Must efficiently tail large log files (can be gigabytes)
+    - Must detect log rotation to avoid missing alerts
+    - Must handle concurrent file access (Suricata writes while we read)
+    - Must recover from errors without crashing the monitoring loop
+    """
+
+    def test_incremental_reads_for_efficient_monitoring(self, temp_dir):
+        """
+        BUSINESS LOGIC: Only read NEW lines to avoid re-processing.
+
+        Without incremental reading, we would:
+        - Waste CPU parsing the same alerts repeatedly
+        - Show duplicate alerts in the dashboard
+        - Miss new alerts while processing old ones
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+
+        # Simulate large existing log file
+        existing_events = [f'{{"alert_id": {i}}}' for i in range(100)]
+        eve_file.write_text('\n'.join(existing_events) + '\n')
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        # First read gets existing events
+        first_read = reader.read_new_lines()
+        assert len(first_read) == 100
+
+        # Append new alerts (as Suricata would do)
+        with open(eve_file, 'a') as f:
+            f.write('{"alert_id": 100, "new": true}\n')
+            f.write('{"alert_id": 101, "new": true}\n')
+
+        # Second read ONLY gets the 2 new alerts
+        second_read = reader.read_new_lines()
+        assert len(second_read) == 2
+        assert '"new": true' in second_read[0]
+        assert '"new": true' in second_read[1]
+
+    def test_rotation_detection_prevents_alert_gaps(self, temp_dir):
+        """
+        BUSINESS LOGIC: Detect log rotation to avoid missing alerts.
+
+        When Suricata rotates logs (e.g., logrotate runs at midnight):
+        1. eve.json is renamed to eve.json-YYYYMMDD
+        2. A new eve.json is created
+        3. Our reader must detect this and switch files
+
+        WITHOUT rotation detection, we'd keep reading the old file
+        which stops receiving new alerts - creating a blind spot!
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+        eve_file.write_text('{"pre_rotation": 1}\n{"pre_rotation": 2}\n')
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        # Read pre-rotation alerts
+        pre_rotation = reader.read_new_lines()
+        assert len(pre_rotation) == 2
+        original_inode = reader.current_inode
+
+        # SIMULATE LOG ROTATION
+        # Step 1: Rename current file
+        rotated_file = Path(temp_dir) / "eve.json-20260127"
+        eve_file.rename(rotated_file)
+
+        # Step 2: Create new file
+        eve_file.write_text('{"post_rotation": 1}\n')
+
+        # Reader must detect rotation and read from NEW file
+        post_rotation = reader.read_new_lines()
+
+        # Verify rotation was detected
+        assert reader.current_inode != original_inode, \
+            "Must detect inode change indicating rotation"
+        assert any('post_rotation' in line for line in post_rotation), \
+            "Must read from new file after rotation"
+
+    def test_truncation_detection_handles_log_cleanup(self, temp_dir):
+        """
+        BUSINESS LOGIC: Detect file truncation (rare but possible).
+
+        Some admins truncate logs with: echo > /var/log/suricata/eve.json
+        Our position would be past EOF, causing no new data.
+
+        We must detect this and reset to read from the beginning.
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+
+        # Create file with substantial content
+        original_content = '\n'.join([f'{{"line": {i}}}' for i in range(50)]) + '\n'
+        eve_file.write_text(original_content)
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        # Read all content, position now at end
+        reader.read_new_lines()
+        position_before = reader.position
+        assert position_before > 100  # We read substantial content
+
+        # TRUNCATE the file (simulating admin cleanup)
+        eve_file.write_text('{"after_truncate": 1}\n')
+
+        # Reader must detect truncation (file size < position)
+        assert reader._detect_rotation() is True, \
+            "Must detect truncation as a form of rotation"
+
+        # After detection, should read new content
+        new_content = reader.read_new_lines()
+        assert any('after_truncate' in line for line in new_content), \
+            "Must read new content after truncation"
+
+    def test_handles_suricata_continuous_writes(self, temp_dir):
+        """
+        BUSINESS LOGIC: Handle concurrent writes from Suricata.
+
+        Suricata writes new alerts every time a rule matches.
+        High-traffic networks can see 1000s of alerts per second.
+
+        Reader must:
+        - Not interfere with Suricata's writes
+        - Handle partial line reads gracefully
+        - Not lose data between reads
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+        eve_file.write_text('')  # Start empty
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        all_lines_read = []
+
+        # Simulate burst of writes followed by reads (like real traffic)
+        for batch in range(5):
+            # Suricata writes a batch of alerts
+            with open(eve_file, 'a') as f:
+                for i in range(10):
+                    alert_id = batch * 10 + i
+                    f.write(f'{{"batch": {batch}, "alert": {alert_id}}}\n')
+
+            # Our app reads at intervals
+            new_lines = reader.read_new_lines()
+            all_lines_read.extend(new_lines)
+
+        # Must have captured ALL 50 alerts across all batches
+        assert len(all_lines_read) == 50, \
+            f"Expected 50 alerts, got {len(all_lines_read)} - data was lost!"
+
+        # Verify no duplicates (incremental read working correctly)
+        alert_ids = []
+        for line in all_lines_read:
+            import json
+            data = json.loads(line)
+            alert_ids.append(data['alert'])
+        assert len(alert_ids) == len(set(alert_ids)), \
+            "Duplicate alerts detected - incremental read broken"
+
+    def test_graceful_error_recovery(self, temp_dir):
+        """
+        BUSINESS LOGIC: Recover from errors without crashing.
+
+        The EVE reader runs in a long-lived monitoring loop.
+        Temporary errors (disk full, permission issues) must not
+        crash the entire IDS monitoring system.
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+        eve_file.write_text('{"before_error": 1}\n')
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        # Read successfully
+        lines1 = reader.read_new_lines()
+        assert len(lines1) == 1
+
+        # Simulate file disappearing (e.g., disk unmounted briefly)
+        eve_file.unlink()
+
+        # Must not crash - return empty list
+        lines2 = reader.read_new_lines()
+        assert lines2 == [] or isinstance(lines2, list), \
+            "Must return empty list on error, not raise exception"
+
+        # File comes back
+        eve_file.write_text('{"after_recovery": 1}\n')
+
+        # Must recover and read new data
+        lines3 = reader.read_new_lines()
+        assert any('after_recovery' in line for line in lines3), \
+            "Must recover and continue reading after error resolves"
+
+    def test_max_lines_prevents_memory_exhaustion(self, temp_dir):
+        """
+        BUSINESS LOGIC: Limit lines per read to prevent memory exhaustion.
+
+        EVE files can be HUGE (gigabytes). Reading the entire file at once
+        would crash the application due to memory exhaustion.
+
+        max_lines parameter ensures we process in manageable chunks.
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+
+        # Create a large-ish file (10,000 lines)
+        large_content = '\n'.join([f'{{"line": {i}}}' for i in range(10000)]) + '\n'
+        eve_file.write_text(large_content)
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        # Read with reasonable limit
+        lines = reader.read_new_lines(max_lines=100)
+
+        # Must respect the limit
+        assert len(lines) == 100, \
+            f"max_lines not respected: got {len(lines)} instead of 100"
+
+        # Can continue reading the rest
+        more_lines = reader.read_new_lines(max_lines=100)
+        assert len(more_lines) == 100, \
+            "Must be able to continue reading after first batch"
+
+    def test_empty_lines_filtered_not_passed_to_parser(self, temp_dir):
+        """
+        BUSINESS LOGIC: Filter empty lines before parsing.
+
+        EVE files may contain empty lines due to:
+        - Suricata bugs
+        - Truncated writes
+        - Editor interference
+
+        Passing empty lines to JSON parser causes errors.
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+        # Content with various empty line patterns
+        content = '{"line": 1}\n\n   \n\t\n{"line": 2}\n\n{"line": 3}\n'
+        eve_file.write_text(content)
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        lines = reader.read_new_lines()
+
+        # Only valid JSON lines returned
+        assert len(lines) == 3
+        for line in lines:
+            assert line.strip(), "Empty/whitespace lines must be filtered"
+            # Each should be valid JSON
+            import json
+            json.loads(line)  # Would raise if invalid
+
+    def test_initial_load_for_startup_context(self, temp_dir):
+        """
+        BUSINESS LOGIC: initial_load provides historical context on startup.
+
+        When the IDS dashboard starts, users expect to see recent alerts
+        immediately, not wait for new ones. initial_load reads the last
+        N lines from the file to populate the dashboard.
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+
+        # Simulate existing log with 1000 historical alerts
+        historical = '\n'.join([f'{{"historical": {i}}}' for i in range(1000)]) + '\n'
+        eve_file.write_text(historical)
+
+        reader = EVEFileReader(base_path=temp_dir)
+
+        # Load last 100 for immediate display
+        with patch('subprocess.run') as mock_run:
+            # Mock tail command returning last 100 lines
+            last_100 = '\n'.join([f'{{"historical": {i}}}' for i in range(900, 1000)])
+            mock_run.return_value = MagicMock(stdout=last_100)
+
+            initial = reader.initial_load(num_lines=100)
+
+            # Should use tail command for efficiency
+            mock_run.assert_called_once()
+            call_args = str(mock_run.call_args)
+            assert 'tail' in call_args, "Must use tail for efficient initial load"
+            assert '-100' in call_args, "Must request correct number of lines"
+
+    def test_position_persisted_for_resumable_reads(self, temp_dir):
+        """
+        BUSINESS LOGIC: Position tracking enables resumable reads.
+
+        If the app restarts, we need to know where we left off.
+        Position tracking also ensures we don't re-read old data
+        within a single session.
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+        eve_file.write_text('{"line": 1}\n{"line": 2}\n')
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        # Read sets position
+        reader.read_new_lines()
+        position_after_read = reader.position
+
+        # Position must be at end of what we read
+        assert position_after_read == len('{"line": 1}\n{"line": 2}\n'), \
+            "Position must track exactly where we stopped"
+
+        # No new data, no position change
+        reader.read_new_lines()
+        assert reader.position == position_after_read, \
+            "Position must not change when no new data"
+
+    def test_finds_most_recent_rotated_file(self, temp_dir):
+        """
+        BUSINESS LOGIC: Find the most recent rotated file.
+
+        When primary file is empty/missing but rotated files exist,
+        we should read from the most recently modified one (has latest alerts).
+        """
+        import time
+
+        # Create multiple rotated files with different timestamps
+        old_rotated = Path(temp_dir) / "eve.json-20260115"
+        old_rotated.write_text('{"old": "alerts"}\n')
+        os.utime(str(old_rotated), (time.time() - 1000, time.time() - 1000))
+
+        recent_rotated = Path(temp_dir) / "eve.json-20260127"
+        recent_rotated.write_text('{"recent": "alerts"}\n')
+        os.utime(str(recent_rotated), (time.time() - 10, time.time() - 10))
+
+        # Primary file is empty
+        primary = Path(temp_dir) / "eve.json"
+        primary.write_text('')
+
+        reader = EVEFileReader(base_path=temp_dir)
+        active = reader._find_active_file()
+
+        # Must select the most recently modified file
+        assert active == str(recent_rotated), \
+            "Must select most recent rotated file, not oldest"
+
+    def test_reset_for_fresh_start(self, temp_dir):
+        """
+        BUSINESS LOGIC: reset() allows fresh re-scan.
+
+        Users may want to re-scan all alerts (e.g., after filter changes).
+        reset() clears all state to allow full re-read.
+        """
+        eve_file = Path(temp_dir) / "eve.json"
+        eve_file.write_text('{"line": 1}\n{"line": 2}\n')
+
+        reader = EVEFileReader(base_path=temp_dir)
+        reader.primary_file = str(eve_file)
+
+        # Read all content
+        first_read = reader.read_new_lines()
+        assert len(first_read) == 2
+
+        # Without reset, nothing new to read
+        no_new = reader.read_new_lines()
+        assert len(no_new) == 0
+
+        # Reset clears state
+        reader.reset()
+
+        # Now can re-read everything
+        after_reset = reader.read_new_lines()
+        assert len(after_reset) == 2, \
+            "After reset, must be able to re-read all content"

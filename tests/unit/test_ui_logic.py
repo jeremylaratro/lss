@@ -15,7 +15,7 @@ from datetime import datetime
 # Create a mock MainWindow class that extracts the testable logic
 # without requiring tkinter initialization
 
-class TestableMainWindowLogic:
+class MockMainWindowLogic:
     """
     Extract testable logic from MainWindow without GUI dependencies.
     These methods are copied/adapted from main_window.py for testing.
@@ -204,7 +204,7 @@ class TestFormatAlertTimestamp:
 
     def test_format_today_timestamp(self):
         """UI-001: Today's timestamp shows time only"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         today = datetime.now().strftime('%Y-%m-%d')
         timestamp = f"{today}T14:30:45.123456"
         result = logic._format_alert_timestamp(timestamp)
@@ -212,20 +212,20 @@ class TestFormatAlertTimestamp:
 
     def test_format_yesterday_timestamp(self):
         """UI-002: Older timestamp shows MM-DD HH:MM"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         timestamp = "2024-01-15T14:30:45.123456"
         result = logic._format_alert_timestamp(timestamp)
         assert result == "01-15 14:30"
 
     def test_format_empty_timestamp(self):
         """UI-003: Empty timestamp returns empty string"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._format_alert_timestamp("") == ""
         assert logic._format_alert_timestamp(None) == ""
 
     def test_format_short_timestamp(self):
         """UI-004: Short timestamp returned as-is"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         result = logic._format_alert_timestamp("2024-01-15")
         assert result == "2024-01-15"
 
@@ -235,37 +235,37 @@ class TestCombineIntelStatus:
 
     def test_both_none(self):
         """UI-005: Both None returns None"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._combine_intel_status(None, None) is None
 
     def test_src_only(self):
         """UI-006: Only src_intel returns src_intel"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._combine_intel_status("DANGER", None) == "DANGER"
 
     def test_dst_only(self):
         """UI-007: Only dst_intel returns dst_intel"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._combine_intel_status(None, "safe") == "safe"
 
     def test_src_higher_priority(self):
         """UI-008: Higher priority src wins"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._combine_intel_status("DANGER", "safe") == "DANGER"
 
     def test_dst_higher_priority(self):
         """UI-009: Higher priority dst wins"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._combine_intel_status("safe", "suspect") == "suspect"
 
     def test_equal_priority(self):
         """UI-010: Equal priority returns src"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._combine_intel_status("safe", "safe") == "safe"
 
     def test_priority_order(self):
         """UI-011: Verify full priority order"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         # DANGER > suspect > error > checking > safe
         assert logic._combine_intel_status("DANGER", "suspect") == "DANGER"
         assert logic._combine_intel_status("suspect", "error") == "suspect"
@@ -278,14 +278,14 @@ class TestApplyAlertFilters:
 
     def test_no_filters(self):
         """UI-012: No filters returns all alerts"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         alerts = [{'signature': 'Test', 'source': '1.1.1.1:80'}]
         result = logic._apply_alert_filters(alerts)
         assert len(result) == 1
 
     def test_filter_by_signature(self):
         """UI-013: Filter by hidden signature"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         logic.hidden_signatures = {'Bad Sig'}
         alerts = [
             {'signature': 'Bad Sig', 'source': '1.1.1.1:80', 'destination': '2.2.2.2:443', 'category': 'Test'},
@@ -297,7 +297,7 @@ class TestApplyAlertFilters:
 
     def test_filter_by_src_ip(self):
         """UI-014: Filter by hidden source IP"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         logic.hidden_src_ips = {'10.0.0.1'}
         alerts = [
             {'signature': 'Test', 'source': '10.0.0.1:80', 'destination': '2.2.2.2:443', 'category': 'Test'},
@@ -309,7 +309,7 @@ class TestApplyAlertFilters:
 
     def test_filter_by_dest_ip(self):
         """UI-015: Filter by hidden destination IP"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         logic.hidden_dest_ips = {'8.8.8.8'}
         alerts = [
             {'signature': 'Test', 'source': '1.1.1.1:80', 'destination': '8.8.8.8:443', 'category': 'Test'},
@@ -321,7 +321,7 @@ class TestApplyAlertFilters:
 
     def test_filter_by_category(self):
         """UI-016: Filter by hidden category"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         logic.hidden_categories = {'Spam'}
         alerts = [
             {'signature': 'Test', 'source': '1.1.1.1:80', 'destination': '2.2.2.2:443', 'category': 'Spam'},
@@ -333,7 +333,7 @@ class TestApplyAlertFilters:
 
     def test_multiple_filters(self):
         """UI-017: Multiple filters applied together"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         logic.hidden_signatures = {'Hidden Sig'}
         logic.hidden_src_ips = {'10.0.0.1'}
         alerts = [
@@ -352,12 +352,12 @@ class TestGroupAlertsBySignature:
 
     def test_empty_list(self):
         """UI-018: Empty list returns empty"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._group_alerts_by_signature([]) == []
 
     def test_no_duplicates(self):
         """UI-019: No duplicates returns same alerts"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         alerts = [
             {'signature': 'Sig A', 'timestamp': '2024-01-15T10:00:00'},
             {'signature': 'Sig B', 'timestamp': '2024-01-15T10:01:00'}
@@ -367,7 +367,7 @@ class TestGroupAlertsBySignature:
 
     def test_groups_duplicates(self):
         """UI-020: Duplicates are grouped with count"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         alerts = [
             {'signature': 'Same Sig', 'timestamp': '2024-01-15T10:00:00'},
             {'signature': 'Same Sig', 'timestamp': '2024-01-15T10:01:00'},
@@ -380,7 +380,7 @@ class TestGroupAlertsBySignature:
 
     def test_keeps_most_recent(self):
         """UI-021: Group keeps most recent timestamp"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         alerts = [
             {'signature': 'Test', 'timestamp': '2024-01-15T10:00:00'},
             {'signature': 'Test', 'timestamp': '2024-01-15T12:00:00'},
@@ -392,7 +392,7 @@ class TestGroupAlertsBySignature:
 
     def test_mixed_signatures(self):
         """UI-022: Mixed signatures grouped separately"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         alerts = [
             {'signature': 'Sig A', 'timestamp': '2024-01-15T10:00:00'},
             {'signature': 'Sig B', 'timestamp': '2024-01-15T10:01:00'},
@@ -411,12 +411,12 @@ class TestGroupConnectionsByRemote:
 
     def test_empty_list(self):
         """UI-023: Empty list returns empty"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._group_connections_by_remote([]) == []
 
     def test_no_duplicates(self):
         """UI-024: No duplicates returns same connections"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         conns = [
             {'remote': '1.1.1.1:80'},
             {'remote': '2.2.2.2:443'}
@@ -426,7 +426,7 @@ class TestGroupConnectionsByRemote:
 
     def test_groups_duplicates(self):
         """UI-025: Duplicates are grouped with count"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         conns = [
             {'remote': '8.8.8.8:443'},
             {'remote': '8.8.8.8:443'},
@@ -443,12 +443,12 @@ class TestGroupTrafficByDestination:
 
     def test_empty_list(self):
         """UI-026: Empty list returns empty"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._group_traffic_by_destination([]) == []
 
     def test_groups_by_destination(self):
         """UI-027: Groups traffic by destination"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         entries = [
             {'destination': '1.1.1.1:443', 'timestamp': '2024-01-15T10:00:00'},
             {'destination': '1.1.1.1:443', 'timestamp': '2024-01-15T10:01:00'},
@@ -462,7 +462,7 @@ class TestGroupTrafficByDestination:
 
     def test_sorted_by_timestamp(self):
         """UI-028: Results sorted by timestamp descending"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         entries = [
             {'destination': 'A', 'timestamp': '2024-01-15T10:00:00'},
             {'destination': 'B', 'timestamp': '2024-01-15T12:00:00'},
@@ -477,12 +477,12 @@ class TestGroupDNSByDomain:
 
     def test_empty_list(self):
         """UI-029: Empty list returns empty"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._group_dns_by_domain([]) == []
 
     def test_groups_by_domain(self):
         """UI-030: Groups DNS by domain"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         entries = [
             {'domain': 'example.com', 'timestamp': '2024-01-15T10:00:00'},
             {'domain': 'example.com', 'timestamp': '2024-01-15T10:01:00'},
@@ -497,30 +497,30 @@ class TestIsLocalIP:
 
     def test_loopback_ipv4(self):
         """UI-031: 127.x.x.x is local"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._is_local_ip("127.0.0.1") is True
         assert logic._is_local_ip("127.0.1.1") is True
 
     def test_loopback_ipv6(self):
         """UI-032: ::1 is local"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._is_local_ip("::1") is True
 
     def test_private_192(self):
         """UI-033: 192.168.x.x is local"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._is_local_ip("192.168.1.1") is True
         assert logic._is_local_ip("192.168.0.100") is True
 
     def test_private_10(self):
         """UI-034: 10.x.x.x is local"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._is_local_ip("10.0.0.1") is True
         assert logic._is_local_ip("10.255.255.255") is True
 
     def test_private_172(self):
         """UI-035: 172.16-31.x.x is local"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._is_local_ip("172.16.0.1") is True
         assert logic._is_local_ip("172.31.255.255") is True
         assert logic._is_local_ip("172.15.0.1") is False
@@ -528,14 +528,14 @@ class TestIsLocalIP:
 
     def test_public_ip(self):
         """UI-036: Public IPs are not local"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._is_local_ip("8.8.8.8") is False
         assert logic._is_local_ip("1.1.1.1") is False
         assert logic._is_local_ip("142.250.80.46") is False
 
     def test_empty_ip(self):
         """UI-037: Empty IP returns False"""
-        logic = TestableMainWindowLogic()
+        logic = MockMainWindowLogic()
         assert logic._is_local_ip("") is False
         assert logic._is_local_ip(None) is False
 

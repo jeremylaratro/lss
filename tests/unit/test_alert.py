@@ -370,3 +370,348 @@ class TestAlertMatchesFilter:
             hidden_dest_ips=set(),
             hidden_categories=set()
         ) is True
+
+
+class TestAlertBusinessLogic:
+    """
+    Test real-world business logic scenarios for alert processing.
+
+    These tests verify the alert model behaves correctly in actual
+    security monitoring use cases, not just basic functionality.
+    """
+
+    def create_alert(self, **kwargs):
+        """Helper to create test alerts with sensible defaults"""
+        defaults = {
+            'engine': 'suricata',
+            'timestamp': '2024-01-15T10:00:00',
+            'severity': 2,
+            'signature': 'ET MALWARE Win32/Emotet Activity',
+            'src_ip': '192.168.1.100',
+            'src_port': '45678',
+            'dest_ip': '185.234.123.45',
+            'dest_port': '443',
+            'proto': 'TCP',
+            'category': 'A Network Trojan was Detected',
+            'sid': '2024001'
+        }
+        defaults.update(kwargs)
+        return Alert(**defaults)
+
+    # --- Severity Classification ---
+
+    def test_severity_escalation_priority(self):
+        """
+        BUSINESS LOGIC: Severity 1 alerts must be immediately visible.
+
+        In a real SOC, CRITICAL alerts trigger immediate response.
+        Lower severities can wait, but severity 1 = potential active breach.
+        """
+        critical = self.create_alert(severity=1)
+        high = self.create_alert(severity=2)
+        medium = self.create_alert(severity=3)
+        low = self.create_alert(severity=4)
+
+        # Verify severity order is correct for dashboard sorting
+        assert critical.severity < high.severity < medium.severity < low.severity
+
+        # Verify labels communicate urgency
+        assert critical.severity_label == 'CRITICAL'
+        assert 'CRITICAL' not in high.severity_label
+
+    def test_severity_negative_treated_as_info(self):
+        """
+        BUSINESS LOGIC: Invalid severity values default to INFO (lowest).
+
+        Malformed alert data shouldn't cause high-priority alerts.
+        Fail-safe: unknown = low priority, not high priority.
+        """
+        alert = self.create_alert(severity=-1)
+        assert alert.severity_label == 'INFO'
+
+        alert = self.create_alert(severity=100)
+        assert alert.severity_label == 'INFO'
+
+    # --- Alert Filtering (UI Display Logic) ---
+
+    def test_filter_order_independence(self):
+        """
+        BUSINESS LOGIC: Filter evaluation order must not affect result.
+
+        An alert that should be hidden must be hidden regardless of
+        which filter catches it first. No filter ordering bugs.
+        """
+        alert = self.create_alert(
+            signature='ET SCAN Suspicious',
+            src_ip='10.0.0.1',
+            category='Attempted Recon'
+        )
+
+        # Hide by signature only
+        result1 = alert.matches_filter(
+            hidden_signatures={'ET SCAN Suspicious'}
+        )
+
+        # Hide by src_ip only
+        result2 = alert.matches_filter(
+            hidden_src_ips={'10.0.0.1'}
+        )
+
+        # Hide by category only
+        result3 = alert.matches_filter(
+            hidden_categories={'Attempted Recon'}
+        )
+
+        # All should hide the alert
+        assert result1 is False
+        assert result2 is False
+        assert result3 is False
+
+    def test_filter_all_conditions_must_pass(self):
+        """
+        BUSINESS LOGIC: Alert is shown only if ALL filters pass.
+
+        This is AND logic: if user hides a signature AND an IP,
+        alerts must not match EITHER criterion to be shown.
+        """
+        alert = self.create_alert(
+            signature='Normal Traffic',
+            src_ip='192.168.1.1'
+        )
+
+        # Alert passes all filters (nothing hidden)
+        assert alert.matches_filter(
+            hidden_signatures={'Bad Sig'},
+            hidden_src_ips={'10.0.0.1'}
+        ) is True
+
+        # Alert fails signature filter
+        assert alert.matches_filter(
+            hidden_signatures={'Normal Traffic'},
+            hidden_src_ips={'10.0.0.1'}
+        ) is False
+
+    def test_filter_case_sensitivity_for_signatures(self):
+        """
+        BUSINESS LOGIC: Signature matching is CASE SENSITIVE.
+
+        IDS signatures have exact names. "ET MALWARE" != "et malware".
+        Case-insensitive matching would cause false positives/negatives.
+        """
+        alert = self.create_alert(signature='ET MALWARE Win32/Agent')
+
+        # Exact match hides
+        assert alert.matches_filter(
+            hidden_signatures={'ET MALWARE Win32/Agent'}
+        ) is False
+
+        # Different case doesn't match
+        assert alert.matches_filter(
+            hidden_signatures={'et malware win32/agent'}
+        ) is True
+
+        # Partial match doesn't hide
+        assert alert.matches_filter(
+            hidden_signatures={'ET MALWARE'}
+        ) is True
+
+    def test_filter_ip_exact_match_required(self):
+        """
+        BUSINESS LOGIC: IP filtering is exact match only.
+
+        Hiding 192.168.1.0 must NOT hide 192.168.1.100.
+        Subnet filtering is a different feature.
+        """
+        alert = self.create_alert(src_ip='192.168.1.100')
+
+        # Exact match hides
+        assert alert.matches_filter(
+            hidden_src_ips={'192.168.1.100'}
+        ) is False
+
+        # Partial/similar IP doesn't hide
+        assert alert.matches_filter(
+            hidden_src_ips={'192.168.1.1'}
+        ) is True
+
+        # Network address doesn't hide host
+        assert alert.matches_filter(
+            hidden_src_ips={'192.168.1.0'}
+        ) is True
+
+    def test_filter_empty_ip_handling(self):
+        """
+        BUSINESS LOGIC: Alerts with empty IPs should still be filterable.
+
+        Some IDS events might not have IP fields (local events).
+        Empty string should be treated as a valid filterable value.
+        """
+        alert = self.create_alert(src_ip='', dest_ip='')
+
+        # Empty IP matches empty filter value
+        assert alert.matches_filter(
+            hidden_src_ips={''}
+        ) is False
+
+        # Empty IP doesn't match non-empty filter
+        assert alert.matches_filter(
+            hidden_src_ips={'192.168.1.1'}
+        ) is True
+
+    def test_engine_filter_with_multiple_engines(self):
+        """
+        BUSINESS LOGIC: Engine filter isolates alerts by source IDS.
+
+        When user selects "Suricata only", Snort alerts must be hidden.
+        This is critical for comparing IDS engine effectiveness.
+        """
+        suricata_alert = self.create_alert(engine='suricata')
+        snort_alert = self.create_alert(engine='snort')
+
+        # Filter for Suricata only
+        assert suricata_alert.matches_filter(engine_filter='suricata') is True
+        assert snort_alert.matches_filter(engine_filter='suricata') is False
+
+        # Filter for Snort only
+        assert suricata_alert.matches_filter(engine_filter='snort') is False
+        assert snort_alert.matches_filter(engine_filter='snort') is True
+
+        # 'all' shows both
+        assert suricata_alert.matches_filter(engine_filter='all') is True
+        assert snort_alert.matches_filter(engine_filter='all') is True
+
+    # --- Data Integrity ---
+
+    def test_from_dict_preserves_data_types(self):
+        """
+        BUSINESS LOGIC: Port numbers must be strings for consistent display.
+
+        Ports can be int or string from JSON. UI needs consistent type
+        for sorting and display. Always store as string.
+        """
+        data = {
+            'engine': 'suricata',
+            'src_port': 80,      # int from JSON
+            'dest_port': '443',  # string
+            'sid': 2001001       # int SID
+        }
+        alert = Alert.from_dict(data)
+
+        # All should be strings
+        assert isinstance(alert.src_port, str)
+        assert isinstance(alert.dest_port, str)
+        assert isinstance(alert.sid, str)
+
+        # Values preserved
+        assert alert.src_port == '80'
+        assert alert.dest_port == '443'
+        assert alert.sid == '2001001'
+
+    def test_from_dict_handles_missing_critical_fields(self):
+        """
+        BUSINESS LOGIC: Missing fields must have safe defaults.
+
+        Malformed IDS output shouldn't crash the app. Default values
+        must be sensible and not cause confusion (e.g., severity=3 not 1).
+        """
+        data = {'engine': 'suricata'}  # Minimal valid data
+        alert = Alert.from_dict(data)
+
+        # Critical fields have safe defaults
+        assert alert.severity == 3  # MEDIUM, not CRITICAL
+        assert alert.signature == 'Unknown'  # Clear it's incomplete
+        assert alert.src_ip == ''  # Empty, not None (breaks string ops)
+        assert alert.dest_ip == ''
+        assert alert.proto == ''
+
+    def test_to_dict_roundtrip_preserves_all_data(self):
+        """
+        BUSINESS LOGIC: Alert data must survive serialization/deserialization.
+
+        Used for alert export, caching, and state persistence.
+        Data loss during roundtrip would corrupt user's alert history.
+        """
+        original = Alert(
+            engine='suricata',
+            timestamp='2024-01-15T10:30:45.123456',
+            severity=1,
+            signature='ET MALWARE CobaltStrike C2',
+            src_ip='192.168.1.50',
+            src_port='49152',
+            dest_ip='185.199.110.153',
+            dest_port='443',
+            proto='TCP',
+            category='A Network Trojan was Detected',
+            sid='2036934',
+            raw={'flow_id': 123456789, 'metadata': {'service': 'https'}}
+        )
+
+        # Roundtrip
+        serialized = original.to_dict()
+        restored = Alert.from_dict(serialized)
+
+        # All fields match
+        assert restored.engine == original.engine
+        assert restored.timestamp == original.timestamp
+        assert restored.severity == original.severity
+        assert restored.signature == original.signature
+        assert restored.src_ip == original.src_ip
+        assert restored.src_port == original.src_port
+        assert restored.dest_ip == original.dest_ip
+        assert restored.dest_port == original.dest_port
+        assert restored.proto == original.proto
+        assert restored.category == original.category
+        assert restored.sid == original.sid
+        assert restored.raw == original.raw
+
+    # --- Performance Considerations ---
+
+    def test_filter_with_large_hidden_sets(self):
+        """
+        BUSINESS LOGIC: Filtering must work with large hide lists.
+
+        Users may hide thousands of signatures over time.
+        Set membership testing must remain fast (O(1) average).
+        """
+        # Simulate large hidden signature list
+        large_hidden = {f'Signature_{i}' for i in range(10000)}
+        large_hidden.add('ET MALWARE Target Signature')
+
+        alert = self.create_alert(signature='ET MALWARE Target Signature')
+
+        # Should still work correctly
+        assert alert.matches_filter(hidden_signatures=large_hidden) is False
+
+        # Non-hidden signature still shows
+        alert2 = self.create_alert(signature='ET SCAN Port Scan')
+        assert alert2.matches_filter(hidden_signatures=large_hidden) is True
+
+    def test_filter_none_vs_empty_set_equivalence(self):
+        """
+        BUSINESS LOGIC: None and empty set must behave identically.
+
+        Callers might pass None or {} depending on context.
+        Both should mean "no filter applied".
+        """
+        alert = self.create_alert()
+
+        # None filter
+        result_none = alert.matches_filter(
+            hidden_signatures=None,
+            hidden_src_ips=None,
+            hidden_dest_ips=None,
+            hidden_categories=None
+        )
+
+        # Empty set filter
+        result_empty = alert.matches_filter(
+            hidden_signatures=set(),
+            hidden_src_ips=set(),
+            hidden_dest_ips=set(),
+            hidden_categories=set()
+        )
+
+        # Both should show the alert
+        assert result_none is True
+        assert result_empty is True
+        assert result_none == result_empty

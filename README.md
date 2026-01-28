@@ -42,6 +42,51 @@ Security Suite Control Panel is a comprehensive desktop application that integra
 
 ---
 
+## Widget Gallery
+
+Quick visual reference of key UI components:
+
+<table>
+<tr>
+<td align="center"><strong>Protocol Statistics</strong><br><img src="marketing/widgets/overview-stats-cards.png" alt="Stats Cards"></td>
+</tr>
+<tr>
+<td align="center"><strong>Tab Navigation</strong><br><img src="marketing/widgets/tab-bar.png" alt="Tab Bar"></td>
+</tr>
+<tr>
+<td align="center"><strong>Time Range Selector</strong><br><img src="marketing/widgets/alerts-time-range.png" alt="Time Range"></td>
+</tr>
+<tr>
+<td align="center"><strong>Alert Filters</strong><br><img src="marketing/widgets/alerts-filter-controls.png" alt="Filter Controls"></td>
+</tr>
+<tr>
+<td align="center"><strong>Traffic Analysis Header</strong><br><img src="marketing/widgets/traffic-header.png" alt="Traffic Header"></td>
+</tr>
+<tr>
+<td align="center"><strong>ClamAV Status Cards</strong><br><img src="marketing/widgets/clamav-status-cards.png" alt="ClamAV Status"></td>
+</tr>
+<tr>
+<td align="center"><strong>ClamAV Service Control</strong><br><img src="marketing/widgets/clamav-service-control.png" alt="ClamAV Service Control"></td>
+</tr>
+<tr>
+<td align="center"><strong>IDS Rule Management</strong><br><img src="marketing/widgets/ids-rule-management.png" alt="Rule Management"></td>
+</tr>
+<tr>
+<td align="center"><strong>JA3/JA4 TLS Fingerprinting</strong><br><img src="marketing/widgets/ids-ja3-fingerprinting.png" alt="JA3/JA4 Fingerprinting"></td>
+</tr>
+<tr>
+<td align="center"><strong>Threat Intel API Status</strong><br><img src="marketing/widgets/intel-api-status.png" alt="Intel API Status"></td>
+</tr>
+<tr>
+<td align="center"><strong>Firewall Status & Controls</strong><br><img src="marketing/widgets/firewall-status.png" alt="Firewall Status"></td>
+</tr>
+<tr>
+<td align="center"><strong>Security Audit Score</strong><br><img src="marketing/widgets/audit-security-score.png" alt="Security Score"></td>
+</tr>
+</table>
+
+---
+
 ## Features
 
 ### Real-time Security Dashboard

@@ -232,28 +232,40 @@ class TestClamAVServiceUpdateSignatures:
 
 
 class TestClamAVServiceGetSignatureCount:
-    """Test get_signature_count() method"""
+    """Test get_signature_count() method - uses pure Python with sigtool"""
 
     @patch('subprocess.run')
-    def test_get_signature_count_success(self, mock_run):
-        """CLAM-014: Get signature count returns number"""
-        mock_run.return_value = MagicMock(stdout="12345678\n", returncode=0)
+    @patch('ids_suite.services.clamav_service.glob.glob')
+    def test_get_signature_count_success(self, mock_glob, mock_run):
+        """CLAM-014: Get signature count returns number from sigtool"""
+        # Mock finding signature database files (.cld and .cvd glob calls)
+        mock_glob.side_effect = [
+            ['/var/lib/clamav/main.cld'],  # First glob for *.cld
+            ['/var/lib/clamav/daily.cvd']  # Second glob for *.cvd
+        ]
+        # Mock sigtool output for each file (6000000 each = 12000000 total)
+        mock_run.return_value = MagicMock(
+            stdout="Build time: 01 Jan 2025\nNumber of signatures: 6000000\n",
+            returncode=0
+        )
         service = ClamAVService()
         result = service.get_signature_count()
-        assert result == "12345678"
+        # 6000000 * 2 files = 12000000
+        assert result == "12000000"
 
     @patch('subprocess.run')
-    def test_get_signature_count_empty(self, mock_run):
-        """CLAM-015: Empty result returns N/A"""
-        mock_run.return_value = MagicMock(stdout="", returncode=0)
+    @patch('ids_suite.services.clamav_service.glob.glob')
+    def test_get_signature_count_empty(self, mock_glob, mock_run):
+        """CLAM-015: No signature files returns N/A"""
+        mock_glob.return_value = []  # No signature files found
         service = ClamAVService()
         result = service.get_signature_count()
         assert result == "N/A"
 
-    @patch('subprocess.run')
-    def test_get_signature_count_exception(self, mock_run):
+    @patch('ids_suite.services.clamav_service.glob.glob')
+    def test_get_signature_count_exception(self, mock_glob):
         """CLAM-016: Exception returns N/A"""
-        mock_run.side_effect = Exception("error")
+        mock_glob.side_effect = Exception("error")
         service = ClamAVService()
         result = service.get_signature_count()
         assert result == "N/A"

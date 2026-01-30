@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional
 
 from ids_suite.threat_intel.cache import ThreatIntelCache
 from ids_suite.core.dependencies import get_requests, REQUESTS_AVAILABLE
+from ids_suite.core.utils import is_private_ip
 
 
 class OTXClient:
@@ -34,6 +35,15 @@ class OTXClient:
 
     def lookup_ip(self, ip: str) -> Dict[str, Any]:
         """Look up IP address in OTX pulses"""
+        # Never send private/LAN IPs to external APIs (SSRF protection)
+        if is_private_ip(ip):
+            return {
+                'error': 'Private/LAN IP - not sent to API',
+                'indicator': ip,
+                'type': 'ip',
+                'is_private': True
+            }
+
         cached = self.cache.get(f"otx:ip:{ip}")
         if cached:
             return cached

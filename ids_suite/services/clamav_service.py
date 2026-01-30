@@ -4,6 +4,8 @@ ClamAV Service manager
 
 import os
 import subprocess
+import glob
+import re
 from typing import Callable, Optional
 
 from ids_suite.services.systemd import SystemdService, ServiceResult, run_privileged_command
@@ -118,17 +120,33 @@ class ClamAVService:
             callback(result)
 
     def get_signature_count(self) -> str:
-        """Get total number of virus signatures"""
+        """Get total number of virus signatures using pure Python (no shell injection risk)"""
         try:
-            # Check both .cld and .cvd files
-            result = subprocess.run(
-                "for f in /var/lib/clamav/*.cld /var/lib/clamav/*.cvd; do "
-                "[ -f \"$f\" ] && sigtool --info \"$f\" 2>/dev/null; done | "
-                "grep 'Number of signatures' | awk '{sum += $4} END {if (sum > 0) print sum}'",
-                shell=True, capture_output=True, text=True, timeout=10
-            )
-            if result.stdout.strip():
-                return result.stdout.strip()
+            clamav_dir = "/var/lib/clamav"
+            total_signatures = 0
+
+            # Find all .cld and .cvd signature database files
+            sig_files = glob.glob(os.path.join(clamav_dir, "*.cld"))
+            sig_files.extend(glob.glob(os.path.join(clamav_dir, "*.cvd")))
+
+            for sig_file in sig_files:
+                if os.path.isfile(sig_file):
+                    try:
+                        # Use list-based subprocess (no shell injection)
+                        result = subprocess.run(
+                            ["sigtool", "--info", sig_file],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        if result.returncode == 0:
+                            # Parse "Number of signatures: NNNN"
+                            match = re.search(r'Number of signatures:\s*(\d+)', result.stdout)
+                            if match:
+                                total_signatures += int(match.group(1))
+                    except (subprocess.TimeoutExpired, FileNotFoundError):
+                        continue
+
+            if total_signatures > 0:
+                return str(total_signatures)
         except Exception:
             pass
         return "N/A"

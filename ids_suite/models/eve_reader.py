@@ -151,9 +151,10 @@ class EVEFileReader:
 
         lines: List[str] = []
         try:
+            # Use list-based subprocess call (no shell injection risk)
             result = subprocess.run(
-                f"tail -{num_lines} '{self.current_file}'",
-                shell=True, capture_output=True, text=True
+                ["tail", f"-{num_lines}", self.current_file],
+                capture_output=True, text=True, timeout=30
             )
             lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
 

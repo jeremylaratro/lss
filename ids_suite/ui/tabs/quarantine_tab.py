@@ -256,11 +256,12 @@ class QuarantineTab(BaseTab):
         if not messagebox.askyesno("Confirm", "Permanently delete ALL quarantined files?"):
             return
 
+        # Use list-based subprocess (no shell injection risk)
         result = subprocess.run(
-            "pkexec /usr/local/bin/av-cleanup",
-            shell=True,
+            ["pkexec", "/usr/local/bin/av-cleanup"],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=60
         )
 
         messagebox.showinfo("Cleanup", result.stdout or "Quarantine cleaned")

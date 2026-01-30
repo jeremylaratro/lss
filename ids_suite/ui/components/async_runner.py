@@ -30,6 +30,7 @@ class AsyncRunner:
         """
         self.root = root
         self._active_threads = []
+        self._threads_lock = threading.Lock()  # Thread safety for _active_threads
 
     def run(
         self,
@@ -91,15 +92,17 @@ class AsyncRunner:
                     if on_finally:
                         on_finally()
 
-                    # Clean up thread reference
-                    if thread in self._active_threads:
-                        self._active_threads.remove(thread)
+                    # Clean up thread reference (thread-safe)
+                    with self._threads_lock:
+                        if thread in self._active_threads:
+                            self._active_threads.remove(thread)
 
             self.root.after(0, update_ui)
 
         # Create and start daemon thread
         thread = threading.Thread(target=thread_worker, daemon=True)
-        self._active_threads.append(thread)
+        with self._threads_lock:
+            self._active_threads.append(thread)
         thread.start()
 
         return thread
@@ -204,16 +207,18 @@ class AsyncRunner:
                 self.root.after(0, on_all_complete)
 
         thread = threading.Thread(target=sequential_worker, daemon=True)
-        self._active_threads.append(thread)
+        with self._threads_lock:
+            self._active_threads.append(thread)
         thread.start()
 
         return thread
 
     def get_active_count(self) -> int:
         """Get number of active background threads."""
-        # Clean up finished threads
-        self._active_threads = [t for t in self._active_threads if t.is_alive()]
-        return len(self._active_threads)
+        # Clean up finished threads (thread-safe)
+        with self._threads_lock:
+            self._active_threads = [t for t in self._active_threads if t.is_alive()]
+            return len(self._active_threads)
 
     def wait_all(self, timeout: Optional[float] = None) -> bool:
         """
@@ -225,7 +230,9 @@ class AsyncRunner:
         Returns:
             True if all threads finished, False if timeout occurred
         """
-        for thread in self._active_threads[:]:
+        with self._threads_lock:
+            threads_copy = self._active_threads[:]
+        for thread in threads_copy:
             thread.join(timeout)
             if thread.is_alive():
                 return False

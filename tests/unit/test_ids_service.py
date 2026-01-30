@@ -5,7 +5,7 @@ Target: 75%+ coverage
 """
 
 import pytest
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock, PropertyMock, mock_open
 import os
 import subprocess
 
@@ -396,23 +396,23 @@ class TestIDSServiceOpenLogs:
 
 
 class TestIDSServiceGetRuleCount:
-    """Test get_rule_count method"""
+    """Test get_rule_count method - uses pure Python file reading"""
 
-    @patch('subprocess.run')
+    @patch('builtins.open', mock_open(read_data="alert tcp any any -> any any (msg:\"Test1\"; sid:1;)\nalert udp any any -> any any (msg:\"Test2\"; sid:2;)\n# comment\n"))
+    @patch('ids_suite.services.ids_service.glob.glob')
     @patch('os.path.exists')
-    def test_get_rule_count_suricata_success(self, mock_exists, mock_run):
-        """IDS-027: get_rule_count() returns count for Suricata"""
+    def test_get_rule_count_suricata_success(self, mock_exists, mock_glob):
+        """IDS-027: get_rule_count() returns count for Suricata via file reading"""
         mock_exists.return_value = True
-        mock_run.return_value = MagicMock(returncode=0, stdout="1234\n")
+        mock_glob.return_value = ['/var/lib/suricata/rules/test.rules']
         engine = MockEngine(name="Suricata")
         svc = IDSService(engine)
 
         count = svc.get_rule_count()
-        assert count == 1234
+        assert count == 2  # Two alert lines in mock file
 
-    @patch('subprocess.run')
     @patch('os.path.exists')
-    def test_get_rule_count_suricata_no_rules_dir(self, mock_exists, mock_run):
+    def test_get_rule_count_suricata_no_rules_dir(self, mock_exists):
         """IDS-028: get_rule_count() returns 0 when rules dir doesn't exist"""
         mock_exists.return_value = False
         engine = MockEngine(name="Suricata")
@@ -421,24 +421,26 @@ class TestIDSServiceGetRuleCount:
         count = svc.get_rule_count()
         assert count == 0
 
-    @patch('subprocess.run')
+    @patch('builtins.open')
+    @patch('ids_suite.services.ids_service.glob.glob')
     @patch('os.path.exists')
-    def test_get_rule_count_suricata_error(self, mock_exists, mock_run):
-        """IDS-029: get_rule_count() returns 0 on error"""
+    def test_get_rule_count_suricata_error(self, mock_exists, mock_glob, mock_file):
+        """IDS-029: get_rule_count() returns 0 on IO error"""
         mock_exists.return_value = True
-        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        mock_glob.return_value = ['/var/lib/suricata/rules/test.rules']
+        mock_file.side_effect = IOError("Permission denied")
         engine = MockEngine(name="Suricata")
         svc = IDSService(engine)
 
         count = svc.get_rule_count()
         assert count == 0
 
-    @patch('subprocess.run')
+    @patch('ids_suite.services.ids_service.glob.glob')
     @patch('os.path.exists')
-    def test_get_rule_count_suricata_exception(self, mock_exists, mock_run):
+    def test_get_rule_count_suricata_exception(self, mock_exists, mock_glob):
         """IDS-030: get_rule_count() returns 0 on exception"""
         mock_exists.return_value = True
-        mock_run.side_effect = Exception("Failed")
+        mock_glob.side_effect = Exception("Failed")
         engine = MockEngine(name="Suricata")
         svc = IDSService(engine)
 
@@ -458,12 +460,13 @@ class TestIDSServiceGetStatusInfo:
     """Test get_status_info method"""
 
     @patch('ids_suite.services.systemd.SystemdService.is_active')
-    @patch('subprocess.run')
+    @patch('builtins.open', mock_open(read_data="alert tcp any any -> any any (msg:\"Test\"; sid:1;)\n" * 500))
+    @patch('ids_suite.services.ids_service.glob.glob')
     @patch('os.path.exists')
-    def test_get_status_info(self, mock_exists, mock_run, mock_active):
+    def test_get_status_info(self, mock_exists, mock_glob, mock_active):
         """IDS-032: get_status_info() returns complete status dict"""
         mock_exists.return_value = True
-        mock_run.return_value = MagicMock(returncode=0, stdout="500\n")
+        mock_glob.return_value = ['/var/lib/suricata/rules/test.rules']
         mock_active.return_value = True
 
         engine = MockEngine(

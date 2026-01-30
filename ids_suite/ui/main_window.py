@@ -4330,16 +4330,30 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
                 return
 
             try:
-                # Add to disable.conf using pkexec with a helper script approach
-                result = subprocess.run(
-                    ["pkexec", "bash", "-c", f"echo '{sid}' >> /etc/suricata/disable.conf"],
-                    capture_output=True, text=True
-                )
-                if result.returncode == 0:
-                    messagebox.showinfo("Success", f"Rule {sid} added to disable list.\nRun 'Update Rules' to apply.")
-                    dialog.destroy()
-                else:
-                    messagebox.showerror("Error", result.stderr)
+                # Use privilege_helper for safe command execution (no shell injection)
+                # Write SID to a temp file, then append to disable.conf
+                import tempfile
+                import shlex
+
+                # Create temp file with the SID content
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.sid', delete=False) as f:
+                    f.write(f"{sid}\n")
+                    temp_path = f.name
+
+                try:
+                    # Use run_privileged_batch for safe privileged execution
+                    result = run_privileged_batch([
+                        f"cat {shlex.quote(temp_path)} >> /etc/suricata/disable.conf"
+                    ])
+                    if result.success:
+                        messagebox.showinfo("Success", f"Rule {sid} added to disable list.\nRun 'Update Rules' to apply.")
+                        dialog.destroy()
+                    else:
+                        messagebox.showerror("Error", result.message)
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 

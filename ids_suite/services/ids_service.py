@@ -4,6 +4,7 @@ IDS Service manager for Suricata and Snort
 
 import os
 import subprocess
+import glob
 from typing import Callable, Optional
 
 from ids_suite.services.systemd import SystemdService, ServiceResult, run_privileged_command
@@ -105,17 +106,22 @@ class IDSService:
             subprocess.Popen(["xdg-open", log_dir])
 
     def get_rule_count(self) -> int:
-        """Get the number of loaded rules"""
+        """Get the number of loaded rules using pure Python (no shell injection risk)"""
         if self.engine.get_name() == "Suricata":
             try:
                 rules_dir = "/var/lib/suricata/rules"
                 if os.path.exists(rules_dir):
-                    result = subprocess.run(
-                        f"cat {rules_dir}/*.rules 2>/dev/null | grep -c '^alert'",
-                        shell=True, capture_output=True, text=True, timeout=10
-                    )
-                    if result.returncode == 0 and result.stdout.strip():
-                        return int(result.stdout.strip())
+                    count = 0
+                    # Use glob for safe file enumeration
+                    for rule_file in glob.glob(os.path.join(rules_dir, "*.rules")):
+                        try:
+                            with open(rule_file, 'r', errors='ignore') as f:
+                                for line in f:
+                                    if line.strip().startswith('alert'):
+                                        count += 1
+                        except (IOError, OSError):
+                            continue
+                    return count
             except Exception:
                 pass
         return 0

@@ -242,7 +242,7 @@ class SecurityControlPanel:
         if KEYRING_AVAILABLE:
             try:
                 return keyring.get_password("security-suite", service)
-            except:
+            except Exception:
                 pass
         return None
 
@@ -258,7 +258,7 @@ class SecurityControlPanel:
                     elif service in self._api_key_cache:
                         del self._api_key_cache[service]
                 return True
-            except:
+            except Exception:
                 pass
         return False
 
@@ -1304,6 +1304,9 @@ class SecurityControlPanel:
         rule_btns2.pack(fill=tk.X)
         self.widgets.create_button(rule_btns2, text="󰑐 Update Rules", command=self.update_rules).pack(side=tk.LEFT, padx=2)
         self.widgets.create_button(rule_btns2, text="󰃢 Disable SID", command=self.disable_rule_dialog).pack(side=tk.LEFT, padx=2)
+        # Previously-unreachable handlers, now wired (LOW-5)
+        self.widgets.create_button(rule_btns2, text="󰈔 Edit Sources File", command=self.edit_rule_sources).pack(side=tk.LEFT, padx=2)
+        self.widgets.create_button(rule_btns2, text="󰈈 View Sources", command=self.view_enabled_rules).pack(side=tk.LEFT, padx=2)
 
         # Network Interface
         iface_frame = ttk.LabelFrame(scrollable_frame, text="󰖟 Network Interface", padding="10")
@@ -1456,29 +1459,43 @@ class SecurityControlPanel:
         svc_grid = ttk.Frame(service_frame)
         svc_grid.pack(fill=tk.X)
 
+        # Track settings-tab service buttons so they can reflect running state
+        # (MED-6). create_button(...).pack(...) returns None, so pack separately
+        # to keep the button reference.
+        self.clamav_settings_btns = {}
+
         # Daemon controls
         daemon_row = ttk.Frame(svc_grid)
         daemon_row.pack(fill=tk.X, pady=2)
         ttk.Label(daemon_row, text="ClamD (Daemon):", width=20).pack(side=tk.LEFT)
-        self.widgets.create_button(daemon_row, text="Start", command=lambda: self.control_clamav_service('clamav-daemon', 'start')).pack(side=tk.LEFT, padx=2)
-        self.widgets.create_button(daemon_row, text="Stop", command=lambda: self.control_clamav_service('clamav-daemon', 'stop')).pack(side=tk.LEFT, padx=2)
+        d_start = self.widgets.create_button(daemon_row, text="Start", command=lambda: self.control_clamav_service('clamav-daemon', 'start'))
+        d_start.pack(side=tk.LEFT, padx=2)
+        d_stop = self.widgets.create_button(daemon_row, text="Stop", command=lambda: self.control_clamav_service('clamav-daemon', 'stop'))
+        d_stop.pack(side=tk.LEFT, padx=2)
         self.widgets.create_button(daemon_row, text="Restart", command=lambda: self.control_clamav_service('clamav-daemon', 'restart')).pack(side=tk.LEFT, padx=2)
+        self.clamav_settings_btns['clamav_daemon'] = {'start': d_start, 'stop': d_stop}
 
         # Freshclam controls
         fresh_row = ttk.Frame(svc_grid)
         fresh_row.pack(fill=tk.X, pady=2)
         ttk.Label(fresh_row, text="Freshclam (Updates):", width=20).pack(side=tk.LEFT)
-        self.widgets.create_button(fresh_row, text="Start", command=lambda: self.control_clamav_service('clamav-freshclam', 'start')).pack(side=tk.LEFT, padx=2)
-        self.widgets.create_button(fresh_row, text="Stop", command=lambda: self.control_clamav_service('clamav-freshclam', 'stop')).pack(side=tk.LEFT, padx=2)
+        f_start = self.widgets.create_button(fresh_row, text="Start", command=lambda: self.control_clamav_service('clamav-freshclam', 'start'))
+        f_start.pack(side=tk.LEFT, padx=2)
+        f_stop = self.widgets.create_button(fresh_row, text="Stop", command=lambda: self.control_clamav_service('clamav-freshclam', 'stop'))
+        f_stop.pack(side=tk.LEFT, padx=2)
         self.widgets.create_button(fresh_row, text="Restart", command=lambda: self.control_clamav_service('clamav-freshclam', 'restart')).pack(side=tk.LEFT, padx=2)
+        self.clamav_settings_btns['clamav_freshclam'] = {'start': f_start, 'stop': f_stop}
 
         # On-Access controls
         onacc_row = ttk.Frame(svc_grid)
         onacc_row.pack(fill=tk.X, pady=2)
         ttk.Label(onacc_row, text="On-Access Scanner:", width=20).pack(side=tk.LEFT)
-        self.widgets.create_button(onacc_row, text="Start", command=lambda: self.control_clamav_service('clamav-clamonacc', 'start')).pack(side=tk.LEFT, padx=2)
-        self.widgets.create_button(onacc_row, text="Stop", command=lambda: self.control_clamav_service('clamav-clamonacc', 'stop')).pack(side=tk.LEFT, padx=2)
+        o_start = self.widgets.create_button(onacc_row, text="Start", command=lambda: self.control_clamav_service('clamav-clamonacc', 'start'))
+        o_start.pack(side=tk.LEFT, padx=2)
+        o_stop = self.widgets.create_button(onacc_row, text="Stop", command=lambda: self.control_clamav_service('clamav-clamonacc', 'stop'))
+        o_stop.pack(side=tk.LEFT, padx=2)
         self.widgets.create_button(onacc_row, text="Restart", command=lambda: self.control_clamav_service('clamav-clamonacc', 'restart')).pack(side=tk.LEFT, padx=2)
+        self.clamav_settings_btns['clamav_clamonacc'] = {'start': o_start, 'stop': o_stop}
 
         # Signature Updates
         sig_frame = ttk.LabelFrame(scrollable_frame, text="󰕑 Signature Updates", padding="10")
@@ -2929,7 +2946,7 @@ class SecurityControlPanel:
                     if selected:
                         try:
                             selected_values = self.conn_tree.item(selected[0], 'values')
-                        except:
+                        except Exception:
                             pass
 
                     # Clear and repopulate
@@ -3671,7 +3688,7 @@ class SecurityControlPanel:
         def do_restart():
             result = subprocess.run(["pkexec", "systemctl", "restart", self.units['suricata']],
                                    capture_output=True, text=True, timeout=30)
-            self.root.after(100, self.refresh_status)
+            self.root.after(100, self.refresh_status_async)
             if result.returncode == 0:
                 self.root.after(100, lambda: messagebox.showinfo("Success", "IDS restarted successfully"))
             else:
@@ -4293,7 +4310,7 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
                 # Clean up temp file
                 try:
                     os.unlink(temp_path)
-                except:
+                except Exception:
                     pass
 
                 def show_result():
@@ -4511,7 +4528,7 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
                 capture_output=True, text=True, timeout=30
             )
             # Refresh all status displays after service control
-            self.root.after(100, self.refresh_status)
+            self.root.after(100, self.refresh_status_async)
             self.root.after(200, self.load_clamav_settings)
             self.root.after(300, self.refresh_clamav_stats)  # Update top stats bar
 
@@ -4532,7 +4549,7 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
         def do_load():
             try:
                 # First refresh the centralized status cache (this also updates all UI)
-                self.root.after(0, self.refresh_status)
+                self.root.after(0, self.refresh_status_async)
 
                 # Get signature info - iterate files in Python for safety
                 try:
@@ -4818,7 +4835,7 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
         try:
             hour, minute = scan_time.split(':')
             int(hour), int(minute)
-        except:
+        except Exception:
             messagebox.showerror("Invalid Time", "Please use HH:MM format for time")
             return
 
@@ -5531,6 +5548,24 @@ For issues or suggestions, see the project repository.
         # Then apply the cached values to the widgets (main thread only)
         self._apply_status_ui()
 
+    def refresh_status_async(self):
+        """Non-blocking status refresh for post-action handlers.
+
+        Same as refresh_status() but gathers the systemctl cache on a worker
+        thread and applies the widgets via after(0), so clicking start/stop/
+        restart never freezes the UI while systemd is slow (MED-4).
+        """
+        def worker():
+            try:
+                self._refresh_service_status_cache()
+            except Exception as e:
+                logger.warning("Async status refresh failed: %s", e, exc_info=True)
+            try:
+                self.root.after(0, self._apply_status_ui)
+            except Exception:
+                pass  # root torn down during shutdown
+        threading.Thread(target=worker, daemon=True).start()
+
     def _apply_status_ui(self):
         """Apply the cached service status to all widgets.
 
@@ -5606,6 +5641,16 @@ For issues or suggestions, see the project repository.
                 fg=self.colors['green'] if statuses['clamav_clamonacc'] else self.colors['yellow']
             )
         except AttributeError:
+            # Widgets may not exist yet during initial load
+            pass
+
+        # === AV CONFIG TAB: settings-tab service buttons reflect state (MED-6) ===
+        try:
+            for key, btns in getattr(self, 'clamav_settings_btns', {}).items():
+                active = statuses.get(key, False)
+                btns['start'].configure(state='disabled' if active else 'normal')
+                btns['stop'].configure(state='normal' if active else 'disabled')
+        except (AttributeError, tk.TclError):
             # Widgets may not exist yet during initial load
             pass
 
@@ -5908,7 +5953,7 @@ For issues or suggestions, see the project repository.
         if selected:
             try:
                 selected_values = self.alerts_tree.item(selected[0], 'values')
-            except:
+            except Exception:
                 pass
 
         # Clear and repopulate
@@ -5923,7 +5968,9 @@ For issues or suggestions, see the project repository.
 
             self.alerts_tree.insert('', 0, values=(
                 self._format_alert_timestamp(alert['timestamp']),
-                sev,
+                # store severity as str to match the change-detection tuple
+                # (new_values uses str(sev)); Tk stores values as strings anyway
+                str(sev),
                 alert['signature'],
                 alert['source'],
                 alert['destination'],
@@ -6283,7 +6330,7 @@ For issues or suggestions, see the project repository.
         if selected:
             try:
                 selected_values = self.alerts_tree.item(selected[0], 'values')
-            except:
+            except Exception:
                 pass
 
         # Clear and repopulate
@@ -7095,7 +7142,7 @@ For issues or suggestions, see the project repository.
         if selected:
             try:
                 selected_values = self.traffic_tree.item(selected[0], 'values')
-            except:
+            except Exception:
                 pass
 
         # Clear and repopulate treeview
@@ -7322,7 +7369,7 @@ For issues or suggestions, see the project repository.
                 second_octet = int(ip.split('.')[1])
                 if 16 <= second_octet <= 31:
                     return True
-            except:
+            except Exception:
                 pass
         # Private Class C (192.168.0.0/16)
         if ip.startswith('192.168.'):
@@ -7486,7 +7533,7 @@ For issues or suggestions, see the project repository.
         if selected:
             try:
                 selected_values = self.dns_tree.item(selected[0], 'values')
-            except:
+            except Exception:
                 pass
 
         # Clear and repopulate treeview
@@ -7789,7 +7836,7 @@ For issues or suggestions, see the project repository.
             if MATPLOTLIB_AVAILABLE:
                 try:
                     self.refresh_analytics()
-                except:
+                except Exception:
                     pass
 
             # Security tabs
@@ -7810,7 +7857,7 @@ For issues or suggestions, see the project repository.
         def do_start():
             result = subprocess.run(["pkexec", "systemctl", "start", self.units['suricata']],
                                    capture_output=True, text=True, timeout=30)
-            self.root.after(100, self.refresh_status)
+            self.root.after(100, self.refresh_status_async)
             if result.returncode == 0:
                 self.root.after(100, lambda: messagebox.showinfo("Success", "IDS started successfully"))
             else:
@@ -7822,7 +7869,7 @@ For issues or suggestions, see the project repository.
         def do_stop():
             result = subprocess.run(["pkexec", "systemctl", "stop", self.units['suricata']],
                                    capture_output=True, text=True, timeout=30)
-            self.root.after(100, self.refresh_status)
+            self.root.after(100, self.refresh_status_async)
             if result.returncode == 0:
                 self.root.after(100, lambda: messagebox.showinfo("Success", "IDS stopped successfully"))
             else:
@@ -7862,7 +7909,7 @@ For issues or suggestions, see the project repository.
                 f"systemctl start {self.units['clamav_freshclam']}",
                 f"systemctl start {self.units['clamav_clamonacc']}",
             ])
-            self.root.after(100, self.refresh_status)
+            self.root.after(100, self.refresh_status_async)
             self.root.after(200, self.refresh_clamav_stats)  # Update top stats bar
             if result.success:
                 self.root.after(100, lambda: messagebox.showinfo("Success", "ClamAV started successfully"))
@@ -7879,7 +7926,7 @@ For issues or suggestions, see the project repository.
                 f"systemctl stop {self.units['clamav_freshclam']}",
                 f"systemctl stop {self.units['clamav_daemon']}",
             ])
-            self.root.after(100, self.refresh_status)
+            self.root.after(100, self.refresh_status_async)
             self.root.after(200, self.refresh_clamav_stats)  # Update top stats bar
             if result.success:
                 self.root.after(100, lambda: messagebox.showinfo("Success", "ClamAV stopped successfully"))
@@ -7982,7 +8029,7 @@ For issues or suggestions, see the project repository.
                                             pass
                 if total_sigs > 0:
                     sig_count = str(total_sigs)
-            except:
+            except Exception:
                 pass
             self.clamav_stat_widgets['signatures'].configure(text=sig_count)
 
@@ -7992,7 +8039,7 @@ For issues or suggestions, see the project repository.
             if os.path.exists(quarantine_dir):
                 try:
                     quarantine_count = len([f for f in os.listdir(quarantine_dir) if os.path.isfile(os.path.join(quarantine_dir, f))])
-                except:
+                except Exception:
                     pass
             self.clamav_stat_widgets['quarantine'].configure(
                 text=str(quarantine_count),
@@ -8048,7 +8095,7 @@ For issues or suggestions, see the project repository.
                         self.clamav_info_text.insert(tk.END, "  Signature database loaded\n")
                 else:
                     self.clamav_info_text.insert(tk.END, "  No signature database found\n")
-            except:
+            except Exception:
                 self.clamav_info_text.insert(tk.END, "  Unable to get signature info\n")
 
             # Recent detections - check multiple log sources
@@ -8067,7 +8114,7 @@ For issues or suggestions, see the project repository.
                                 found_detections = True
                             elif line.strip():
                                 self.clamav_detect_text.insert(tk.END, f"{line}\n", 'info')
-                except:
+                except Exception:
                     pass
 
             # Also check clamd.log for FOUND entries
@@ -8085,7 +8132,7 @@ For issues or suggestions, see the project repository.
                         for line in result.stdout.strip().split('\n'):
                             self.clamav_detect_text.insert(tk.END, f"{line}\n", 'threat')
                             found_detections = True
-                except:
+                except Exception:
                     pass
 
             # Check user scan logs
@@ -8104,7 +8151,7 @@ For issues or suggestions, see the project repository.
                         for line in result.stdout.strip().split('\n'):
                             self.clamav_detect_text.insert(tk.END, f"{line}\n", 'threat')
                             found_detections = True
-                except:
+                except Exception:
                     pass
 
             if not found_detections:
@@ -8127,7 +8174,7 @@ For issues or suggestions, see the project repository.
                 try:
                     with open(metadata_file, 'r') as f:
                         metadata = json.load(f)
-                except:
+                except Exception:
                     pass
 
             files = []
@@ -8188,7 +8235,7 @@ For issues or suggestions, see the project repository.
             if selected:
                 try:
                     selected_values = self.quarantine_tree.item(selected[0], 'values')
-                except:
+                except Exception:
                     pass
 
             # Clear existing items
@@ -8445,9 +8492,9 @@ For issues or suggestions, see the project repository.
             try:
                 self.scan_process.terminate()
                 self.scan_process.wait(timeout=5)
-            except:
+            except Exception:
                 try:
                     self.scan_process.kill()
-                except:
+                except Exception:
                     pass
 

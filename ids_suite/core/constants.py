@@ -89,10 +89,18 @@ class Limits:
 
 @dataclass(frozen=True)
 class ServiceNames:
-    """Systemd service names"""
+    """Host-default systemd unit names for IDS/AV components.
+
+    These are fallback/default names only. The GUI auto-detects the actual
+    active unit at runtime (see ids_suite.core.utils.get_distro_config), since
+    the correct ClamAV daemon unit differs by distribution (e.g. Fedora/RHEL
+    use the "clamd@scan" template unit, while Debian/Ubuntu/Arch use
+    "clamav-daemon").
+    """
     SURICATA = "suricata-laptop"
     SNORT = "snort"
-    CLAMD = "clamd@scan"
+    CLAMAV_DAEMON = "clamav-daemon"
+    CLAMAV_CLAMONACC = "clamav-clamonacc"
     FRESHCLAM = "clamav-freshclam"
 
 

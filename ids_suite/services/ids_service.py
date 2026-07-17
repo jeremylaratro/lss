@@ -44,7 +44,7 @@ class IDSService:
     def update_rules(self, callback: Optional[Callable[[ServiceResult], None]] = None) -> None:
         """Update IDS rules (Suricata-specific)"""
         if self.engine.get_name() == "Suricata":
-            result = run_privileged_command("suricata-update --no-test")
+            result = run_privileged_command(["suricata-update", "--no-test"])
         else:
             # Snort rule update would be different
             result = ServiceResult(
@@ -58,7 +58,7 @@ class IDSService:
     def reload_rules(self, callback: Optional[Callable[[ServiceResult], None]] = None) -> None:
         """Reload rules without full restart"""
         if self.engine.get_name() == "Suricata":
-            result = run_privileged_command("suricatasc -c reload-rules")
+            result = run_privileged_command(["suricatasc", "-c", "reload-rules"])
         else:
             result = self.service.reload()
         if callback:
@@ -89,7 +89,7 @@ class IDSService:
 
     def clean_logs(self, callback: Optional[Callable[[ServiceResult], None]] = None) -> None:
         """Clean IDS logs using cleanup script"""
-        result = run_privileged_command("/usr/local/bin/ids-cleanup")
+        result = run_privileged_command(["/usr/local/bin/ids-cleanup"])
         if callback:
             callback(result)
 

@@ -74,11 +74,12 @@ class TestEVEFileReader:
         reader.current_file = str(eve_file)
         reader.current_inode = reader._get_inode(str(eve_file))
 
-        # Delete and recreate (new inode)
-        eve_file.unlink()
-        eve_file.write_text('{"event": "new"}\n')
-
-        assert reader._detect_rotation() is True
+        # Simulate a new inode. NOTE: a real unlink()+recreate can reuse the same
+        # inode number on some filesystems (e.g. tmpfs on /tmp), which made this
+        # test flaky. Mock the observed inode so we deterministically exercise
+        # the inode-change branch of _detect_rotation.
+        with patch.object(reader, '_get_inode', return_value=(reader.current_inode or 0) + 1):
+            assert reader._detect_rotation() is True
 
     def test_detect_rotation_file_truncated(self, temp_dir):
         """Test rotation detected when file is truncated"""
@@ -322,9 +323,13 @@ class TestEVEFileReader:
         content = '\n'.join([f'{{"line": {i}}}' for i in range(1, 21)]) + '\n'
         eve_file.write_text(content)
 
-        # Mock subprocess.run to return content
+        # Mock subprocess.run to return content (returncode 0 = tail succeeded;
+        # initial_load now checks returncode so it doesn't treat a failed tail
+        # as success — CRIT-2)
         mock_result = Mock()
         mock_result.stdout = content
+        mock_result.stderr = ''
+        mock_result.returncode = 0
         mock_run.return_value = mock_result
 
         reader = EVEFileReader(base_path=temp_dir)
@@ -439,10 +444,14 @@ class TestEVEFileReader:
 
         reader = EVEFileReader(base_path=temp_dir)
 
-        # Mock open to raise PermissionError
+        # CRIT-2: _read_from_position now PROPAGATES PermissionError (instead of
+        # silently returning []) so read_new_lines can fall back to a privileged
+        # read. It also records a human-readable last_error for the UI.
         with patch('builtins.open', side_effect=PermissionError):
-            lines = reader._read_from_position(str(eve_file), 0)
-            assert lines == []
+            with pytest.raises(PermissionError):
+                reader._read_from_position(str(eve_file), 0)
+        assert reader.last_error is not None
+        assert reader.get_last_error() == reader.last_error
 
     def test_concurrent_rotation_handling(self, temp_dir):
         """Test handling rotation that occurs during read"""
@@ -457,14 +466,16 @@ class TestEVEFileReader:
         assert len(lines1) == 2
 
         # Simulate log rotation
-        old_inode = reader.current_inode
         eve_file.unlink()
         eve_file.write_text('{"line": 3}\n')
 
-        # Should detect rotation and reset
+        # Should detect rotation (via inode change OR the truncation/size check)
+        # and read the new file's contents. We assert on BEHAVIOR (the new line
+        # is surfaced) rather than the raw inode number, which is unreliable
+        # because some filesystems reuse inode numbers after unlink/recreate.
         lines2 = reader.read_new_lines()
-        assert reader.current_inode != old_inode
         assert reader.position >= 0
+        assert any('3' in l for l in lines2), "rotation should surface the new file's line"
 
 
 class TestEVEReaderBusinessLogic:
@@ -742,9 +753,10 @@ class TestEVEReaderBusinessLogic:
 
         # Load last 100 for immediate display
         with patch('subprocess.run') as mock_run:
-            # Mock tail command returning last 100 lines
+            # Mock tail command returning last 100 lines (returncode 0 so the
+            # success path is taken and no privileged fallback is attempted)
             last_100 = '\n'.join([f'{{"historical": {i}}}' for i in range(900, 1000)])
-            mock_run.return_value = MagicMock(stdout=last_100)
+            mock_run.return_value = MagicMock(stdout=last_100, stderr='', returncode=0)
 
             initial = reader.initial_load(num_lines=100)
 

@@ -37,7 +37,13 @@ class WidgetFactory:
                 text_color=self.colors.get('fg', '#ffffff'),
                 corner_radius=8, height=32, **kwargs
             )
-        return ttk.Button(parent, text=text, command=command)
+        # Forward the kwargs ttk.Button understands (e.g. width/state passed by
+        # callers) instead of silently dropping them (LOW-1). CTk-only kwargs
+        # like corner_radius are never passed to this fallback path.
+        ttk_safe = {k: v for k, v in kwargs.items()
+                    if k in ('width', 'state', 'style', 'cursor', 'padding',
+                             'image', 'compound', 'takefocus', 'underline')}
+        return ttk.Button(parent, text=text, command=command, **ttk_safe)
 
     def create_entry(
         self,

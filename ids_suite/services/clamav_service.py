@@ -10,6 +10,7 @@ from typing import Callable, Optional
 
 from ids_suite.services.systemd import SystemdService, ServiceResult, run_privileged_command
 from ids_suite.services.privilege_helper import run_privileged_batch, CommandResult
+from ids_suite.core.constants import ServiceNames
 
 
 class ClamAVService:
@@ -20,9 +21,9 @@ class ClamAVService:
     """
 
     def __init__(self):
-        self.daemon = SystemdService("clamav-daemon")
-        self.freshclam = SystemdService("clamav-freshclam")
-        self.clamonacc = SystemdService("clamav-clamonacc")
+        self.daemon = SystemdService(ServiceNames.CLAMAV_DAEMON)
+        self.freshclam = SystemdService(ServiceNames.FRESHCLAM)
+        self.clamonacc = SystemdService(ServiceNames.CLAMAV_CLAMONACC)
 
     def _convert_result(self, cmd_result: CommandResult) -> ServiceResult:
         """Convert CommandResult to ServiceResult for API compatibility"""
@@ -37,9 +38,9 @@ class ClamAVService:
     def start(self, callback: Optional[Callable[[ServiceResult], None]] = None) -> None:
         """Start all ClamAV services with single auth prompt"""
         cmd_result = run_privileged_batch([
-            "systemctl start clamav-daemon",
-            "systemctl start clamav-freshclam",
-            "systemctl start clamav-clamonacc",
+            f"systemctl start {ServiceNames.CLAMAV_DAEMON}",
+            f"systemctl start {ServiceNames.FRESHCLAM}",
+            f"systemctl start {ServiceNames.CLAMAV_CLAMONACC}",
         ])
 
         result = ServiceResult(
@@ -55,9 +56,9 @@ class ClamAVService:
     def stop(self, callback: Optional[Callable[[ServiceResult], None]] = None) -> None:
         """Stop all ClamAV services (in reverse order) with single auth prompt"""
         cmd_result = run_privileged_batch([
-            "systemctl stop clamav-clamonacc",
-            "systemctl stop clamav-freshclam",
-            "systemctl stop clamav-daemon",
+            f"systemctl stop {ServiceNames.CLAMAV_CLAMONACC}",
+            f"systemctl stop {ServiceNames.FRESHCLAM}",
+            f"systemctl stop {ServiceNames.CLAMAV_DAEMON}",
         ])
 
         result = ServiceResult(
@@ -73,9 +74,9 @@ class ClamAVService:
     def restart(self, callback: Optional[Callable[[ServiceResult], None]] = None) -> None:
         """Restart all ClamAV services with single auth prompt"""
         cmd_result = run_privileged_batch([
-            "systemctl restart clamav-daemon",
-            "systemctl restart clamav-freshclam",
-            "systemctl restart clamav-clamonacc",
+            f"systemctl restart {ServiceNames.CLAMAV_DAEMON}",
+            f"systemctl restart {ServiceNames.FRESHCLAM}",
+            f"systemctl restart {ServiceNames.CLAMAV_CLAMONACC}",
         ])
 
         result = ServiceResult(
@@ -104,9 +105,9 @@ class ClamAVService:
         """Update virus signatures using freshclam with single auth prompt"""
         # Batch: stop freshclam, run freshclam manually, restart freshclam
         cmd_result = run_privileged_batch([
-            "systemctl stop clamav-freshclam",
+            f"systemctl stop {ServiceNames.FRESHCLAM}",
             "freshclam",
-            "systemctl start clamav-freshclam",
+            f"systemctl start {ServiceNames.FRESHCLAM}",
         ])
 
         result = ServiceResult(
@@ -163,7 +164,7 @@ class ClamAVService:
 
     def clean_logs(self, callback: Optional[Callable[[ServiceResult], None]] = None) -> None:
         """Clean ClamAV logs using cleanup script"""
-        result = run_privileged_command("/usr/local/bin/av-cleanup")
+        result = run_privileged_command(["/usr/local/bin/av-cleanup"])
         if callback:
             callback(result)
 

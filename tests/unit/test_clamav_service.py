@@ -235,14 +235,16 @@ class TestClamAVServiceGetSignatureCount:
     """Test get_signature_count() method - uses pure Python with sigtool"""
 
     @patch('subprocess.run')
+    @patch('os.path.isfile')
     @patch('ids_suite.services.clamav_service.glob.glob')
-    def test_get_signature_count_success(self, mock_glob, mock_run):
+    def test_get_signature_count_success(self, mock_glob, mock_isfile, mock_run):
         """CLAM-014: Get signature count returns number from sigtool"""
         # Mock finding signature database files (.cld and .cvd glob calls)
         mock_glob.side_effect = [
             ['/var/lib/clamav/main.cld'],  # First glob for *.cld
             ['/var/lib/clamav/daily.cvd']  # Second glob for *.cvd
         ]
+        mock_isfile.return_value = True
         # Mock sigtool output for each file (6000000 each = 12000000 total)
         mock_run.return_value = MagicMock(
             stdout="Build time: 01 Jan 2025\nNumber of signatures: 6000000\n",
@@ -321,7 +323,8 @@ class TestClamAVServiceCleanLogs:
 
         service.clean_logs(callback)
 
-        mock_cmd.assert_called_once_with("/usr/local/bin/av-cleanup")
+        # MED-2 fix: run_privileged_command requires a list of argv.
+        mock_cmd.assert_called_once_with(["/usr/local/bin/av-cleanup"])
         assert callback_result is not None
 
 

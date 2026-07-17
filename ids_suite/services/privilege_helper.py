@@ -12,6 +12,7 @@ Three strategies are provided:
 
 import subprocess
 import os
+import re
 import tempfile
 import shlex
 from typing import List, Tuple, Optional, Callable, Dict
@@ -20,9 +21,15 @@ from pathlib import Path
 
 
 # Command whitelist - only these commands with these arguments are allowed
+# firewall-cmd and ufw are whitelisted for firewall control (reload/add-port/
+# remove-port and enable/disable/reset/allow/deny respectively); dynamic
+# port/protocol values are validated via regex in validate_command() below.
 ALLOWED_COMMANDS = {
     'systemctl': {
         'allowed_args': ['start', 'stop', 'restart', 'reload', 'status', 'enable', 'disable', 'daemon-reload', '--now'],
+        # NOTE: keep in sync with main_window._UNIT_CANDIDATES — the GUI
+        # auto-detects the active unit name per host and any name it may pick
+        # MUST be whitelisted here, or privileged control of that unit fails.
         'allowed_services': [
             'suricata-laptop',
             'suricata',
@@ -31,6 +38,9 @@ ALLOWED_COMMANDS = {
             'clamav-freshclam',
             'clamav-clamonacc',
             'clamd@scan',
+            'clamd',
+            'freshclam',
+            'clamonacc',
             'clamav-scheduled-scan.timer',
             'firewalld'
         ]
@@ -72,6 +82,16 @@ ALLOWED_COMMANDS = {
         'allowed_args': ['-f'],
         'validate_paths': True,
         'max_args': 2
+    },
+    'firewall-cmd': {
+        # --add-port=/--remove-port= carry a dynamic PORT[-PORT]/tcp|udp value
+        # that is validated separately (see validate_command)
+        'allowed_args': ['--complete-reload', '--reload', '--permanent']
+    },
+    'ufw': {
+        # allow/deny carry a dynamic port (optionally with /tcp|/udp) that is
+        # validated separately (see validate_command)
+        'allowed_args': ['enable', 'disable', 'reset', 'allow', 'deny']
     }
 }
 
@@ -179,6 +199,63 @@ def validate_command(command: str) -> List[str]:
                     f"Allowed: {', '.join(config['allowed_commands'])}"
                 )
 
+    # Validate firewall-cmd commands
+    elif binary == 'firewall-cmd':
+        if not args:
+            raise CommandValidationError("firewall-cmd requires at least one argument")
+
+        port_action_prefixes = ('--add-port=', '--remove-port=')
+
+        for arg in args:
+            if arg in config['allowed_args']:
+                continue
+            if arg.startswith(port_action_prefixes):
+                _, _, value = arg.partition('=')
+                if not _is_valid_port_spec(value, allow_range=True, require_proto=True):
+                    raise CommandValidationError(
+                        f"firewall-cmd port spec '{value}' is not valid "
+                        f"(expected PORT[-PORT]/tcp or PORT[-PORT]/udp, ports 1-65535)"
+                    )
+                continue
+            raise CommandValidationError(
+                f"Argument '{arg}' not allowed for firewall-cmd. "
+                f"Allowed: {', '.join(config['allowed_args'])}, "
+                f"--add-port=PORT[-PORT]/tcp|udp, --remove-port=PORT[-PORT]/tcp|udp"
+            )
+
+    # Validate ufw commands
+    elif binary == 'ufw':
+        if not args:
+            raise CommandValidationError("ufw requires at least one argument")
+
+        # Allow an optional leading --force (needed for non-interactive
+        # `ufw --force enable` / `ufw --force reset`, which would otherwise
+        # block on an interactive y/n prompt under pkexec).
+        if args[0] == '--force':
+            args = args[1:]
+            if not args:
+                raise CommandValidationError("ufw --force requires an action")
+
+        action = args[0]
+        if action not in config['allowed_args']:
+            raise CommandValidationError(
+                f"ufw action '{action}' not allowed. "
+                f"Allowed: {', '.join(config['allowed_args'])}"
+            )
+
+        if action in ('enable', 'disable', 'reset'):
+            if len(args) != 1:
+                raise CommandValidationError(f"ufw {action} takes no additional arguments")
+        elif action in ('allow', 'deny'):
+            if len(args) != 2:
+                raise CommandValidationError(f"ufw {action} requires exactly one port argument")
+
+            if not _is_valid_port_spec(args[1], allow_range=False):
+                raise CommandValidationError(
+                    f"ufw port '{args[1]}' is not valid "
+                    f"(expected PORT or PORT/tcp or PORT/udp, ports 1-65535)"
+                )
+
     # Validate commands with path restrictions (cp, chmod, rm)
     elif config.get('validate_paths'):
         if binary == 'cp':
@@ -257,7 +334,7 @@ def validate_command(command: str) -> List[str]:
 
     # Validate allowed arguments for commands with strict argument lists
     # Skip commands that have their own validation logic above
-    path_validated_commands = ['systemctl', 'suricatasc', 'cp', 'chmod', 'rm', 'mkdir', 'chown']
+    path_validated_commands = ['systemctl', 'suricatasc', 'cp', 'chmod', 'rm', 'mkdir', 'chown', 'firewall-cmd', 'ufw']
     if 'allowed_args' in config and binary not in path_validated_commands:
         for arg in args:
             if arg not in config['allowed_args']:
@@ -295,6 +372,45 @@ def _is_safe_path(path: str) -> bool:
             return True
 
     return False
+
+
+_PORT_SPEC_RE = re.compile(r'^(\d{1,5})(?:-(\d{1,5}))?(?:/(tcp|udp))?$')
+
+
+def _is_valid_port_spec(spec: str, allow_range: bool = False, require_proto: bool = False) -> bool:
+    """Check if a firewall port spec (e.g. '8080', '8080/tcp', '8000-8010/udp')
+    is well-formed, with each port number in the valid 1-65535 range.
+
+    Args:
+        spec: The port spec to validate.
+        allow_range: Whether a PORT-PORT range is permitted (firewall-cmd
+            supports ranges; ufw's `allow`/`deny` do not).
+        require_proto: Whether the /tcp|/udp suffix is mandatory (firewalld's
+            --add-port/--remove-port require it; ufw's allow/deny do not).
+    """
+    match = _PORT_SPEC_RE.match(spec)
+    if not match:
+        return False
+
+    start_str, end_str, proto = match.groups()
+
+    if end_str is not None and not allow_range:
+        return False
+
+    if require_proto and proto is None:
+        return False
+
+    for port_str in (start_str, end_str):
+        if port_str is None:
+            continue
+        port = int(port_str)
+        if not (1 <= port <= 65535):
+            return False
+
+    if end_str is not None and int(start_str) > int(end_str):
+        return False
+
+    return True
 
 
 class PrivilegeHelper:

@@ -12,9 +12,12 @@ import os
 import csv
 import io
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Import from our modular packages
 from ids_suite.core.constants import Colors
@@ -163,9 +166,23 @@ class SecurityControlPanel:
         self.eve_event_buffer = []  # ALL parsed events within retention window (raw JSON dicts)
         self.eve_initial_load_done = False
         self.eve_buffer_last_update = None  # Track when buffer was last updated
+        # Hard cap on buffer size so a busy sensor can't grow it without bound
+        # (retention below is measured from the newest event, not wall-clock).
+        self.MAX_EVENT_BUFFER = 50000
+        # Re-entrancy guard so overlapping auto-refresh workers don't pile up.
+        self._refresh_in_progress = False
+        # Surfaced when the EVE reader can't read the log (permission/IO), so the
+        # user sees *why* the alerts view is empty instead of a silent blank.
+        self._eve_health_msg = None
 
         # Data retention settings (in minutes)
         self.data_retention_minutes = 120  # Default 120 minutes
+
+        # Systemd unit names for THIS host (distros differ: suricata vs
+        # suricata-laptop, clamav-daemon vs clamd@scan). Start with fast
+        # defaults (first candidate) so __init__ never blocks on systemctl, then
+        # refine via _detect_service_units() on the background startup worker.
+        self.units = {logical: cands[0] for logical, cands in self._UNIT_CANDIDATES.items()}
 
         # Cached data with timestamps for each tab
         self.activity_cache = []  # Overview tab recent activity
@@ -212,7 +229,7 @@ class SecurityControlPanel:
                     if key:
                         keys[service] = key
             except Exception as e:
-                print(f"Warning: Could not load API keys from keyring: {e}")
+                logger.warning("Could not load API keys from keyring: %s", e)
         return keys
 
     def _get_api_key(self, service: str) -> str:
@@ -537,13 +554,24 @@ class SecurityControlPanel:
             self.filter_alerts_treeview(search_text)
 
     def show_progress(self, message="Working..."):
-        """Show progress bar with message"""
+        """Show progress bar with message.
+
+        Thread-safe: several callers invoke this from worker threads. Tk is not
+        thread-safe, so if we're off the main thread we marshal the widget
+        mutation back via ``root.after`` (HIGH-5).
+        """
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, lambda: self.show_progress(message))
+            return
         self.progress_label.configure(text=message)
         self.progress_frame.pack(fill=tk.X, pady=(0, 5))
         self.progress_bar.start(10)
 
     def hide_progress(self):
-        """Hide progress bar"""
+        """Hide progress bar. Thread-safe (see show_progress)."""
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, self.hide_progress)
+            return
         self.progress_bar.stop()
         self.progress_frame.pack_forget()
 
@@ -614,6 +642,11 @@ class SecurityControlPanel:
         self.time_range_status = ttk.Label(time_frame, text=f"󰋚 Live (last {self.data_retention_minutes} min)", foreground=self.colors['green'])
         self.time_range_status.pack(side=tk.LEFT, padx=(15, 0))
 
+        # Health banner: surfaces WHY the alerts view is empty (e.g. the EVE log
+        # can't be read) instead of showing a silent blank grid (CRIT-2).
+        self.eve_health_label = ttk.Label(time_frame, text="", foreground=self.colors['red'])
+        self.eve_health_label.pack(side=tk.LEFT, padx=(15, 0))
+
         # Historical mode indicator
         self.historical_mode = False
         self.historical_alerts = []
@@ -622,13 +655,13 @@ class SecurityControlPanel:
         filter_frame = ttk.Frame(tab)
         filter_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Engine filter (Suricata/Snort/Both)
+        # Engine filter. NOTE: this view is backed by Suricata's eve.json only,
+        # so we deliberately do NOT offer "Snort" here — selecting it would
+        # silently filter out every event and show an empty grid (MED-5).
         self.widgets.create_label(filter_frame, text="Engine:").pack(side=tk.LEFT, padx=(0, 5))
         engine_values = ["All"]
         if self.suricata_engine.is_installed():
             engine_values.append("Suricata")
-        if self.snort_engine.is_installed():
-            engine_values.append("Snort")
         engine_combo = ttk.Combobox(filter_frame, textvariable=self.engine_filter,
                                      values=engine_values, width=10, state='readonly')
         engine_combo.pack(side=tk.LEFT, padx=(0, 15))
@@ -637,7 +670,8 @@ class SecurityControlPanel:
         self.widgets.create_label(filter_frame, text="Severity:").pack(side=tk.LEFT, padx=(0, 5))
         self.severity_var = tk.StringVar(value="all")
         severity_combo = ttk.Combobox(filter_frame, textvariable=self.severity_var,
-                                       values=["all", "1 - High", "2 - Medium", "3 - Low"], width=15)
+                                       values=["all", "1 - High", "2 - Medium", "3 - Low"],
+                                       width=15, state='readonly')
         severity_combo.pack(side=tk.LEFT, padx=(0, 15))
         severity_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh_alerts())
 
@@ -1545,7 +1579,7 @@ class SecurityControlPanel:
         onacc_frame.pack(fill=tk.X, pady=5, padx=5)
 
         self.onacc_enabled_var = tk.BooleanVar(value=False)
-        self.widgets.create_checkbox(onacc_frame, text="Enable On-Access scanning now (real-time protection)",
+        self.widgets.create_checkbox(onacc_frame, text="Enable On-Access scanning (real-time protection) — applied on Apply/Restart",
                        variable=self.onacc_enabled_var).pack(anchor=tk.W)
 
         # Watch paths
@@ -2925,7 +2959,7 @@ class SecurityControlPanel:
                 self.root.after(0, update_ui)
 
             except Exception as e:
-                print(f"Error refreshing connections: {e}")
+                logger.warning("Error refreshing connections: %s", e)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
@@ -3101,22 +3135,29 @@ class SecurityControlPanel:
             if is_firewalld:
                 if action == 'enable':
                     # Batch both commands with single auth
-                    run_privileged_batch([
+                    cmd_result = run_privileged_batch([
                         "systemctl start firewalld",
                         "systemctl enable firewalld",
                     ])
                 elif action == 'disable':
-                    run_privileged_batch(["systemctl stop firewalld"])
+                    cmd_result = run_privileged_batch(["systemctl stop firewalld"])
                 else:  # reset
-                    run_privileged_batch(["firewall-cmd --complete-reload"])
+                    cmd_result = run_privileged_batch(["firewall-cmd --complete-reload"])
             else:
                 if action == 'enable':
-                    run_privileged_batch(["ufw --force enable"])
+                    cmd_result = run_privileged_batch(["ufw --force enable"])
                 elif action == 'disable':
-                    run_privileged_batch(["ufw disable"])
+                    cmd_result = run_privileged_batch(["ufw disable"])
                 else:  # reset
-                    run_privileged_batch(["ufw --force reset"])
+                    cmd_result = run_privileged_batch(["ufw --force reset"])
 
+            # Surface failures instead of silently discarding them: previously
+            # firewall-cmd/ufw weren't whitelisted so every action failed and the
+            # button appeared to do nothing (HIGH-2).
+            if cmd_result is not None and not cmd_result.success:
+                logger.warning("Firewall %s failed: %s", action, cmd_result.message)
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Firewall Error", f"Failed to {action} firewall:\n\n{cmd_result.message}"))
             self.root.after(0, self.refresh_firewall)
 
         threading.Thread(target=do_action, daemon=True).start()
@@ -3459,7 +3500,7 @@ class SecurityControlPanel:
                             continue
 
                 except Exception as e:
-                    print(f"Error reading EVE: {e}")
+                    logger.warning("Error reading EVE: %s", e)
                     self.root.after(0, lambda: self._show_analytics_error(f"Error reading log: {e}"))
                     return
 
@@ -3474,7 +3515,7 @@ class SecurityControlPanel:
                 self.root.after(0, update_charts)
 
             except Exception as e:
-                print(f"Analytics refresh error: {e}")
+                logger.warning("Analytics refresh error: %s", e)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
@@ -3628,7 +3669,7 @@ class SecurityControlPanel:
     def restart_ids(self):
         """Restart the Suricata IDS service"""
         def do_restart():
-            result = subprocess.run(["pkexec", "systemctl", "restart", "suricata-laptop"],
+            result = subprocess.run(["pkexec", "systemctl", "restart", self.units['suricata']],
                                    capture_output=True, text=True, timeout=30)
             self.root.after(100, self.refresh_status)
             if result.returncode == 0:
@@ -3644,7 +3685,7 @@ class SecurityControlPanel:
             try:
                 # Get service status
                 result = subprocess.run(
-                    ["systemctl", "is-active", "suricata-laptop"],
+                    ["systemctl", "is-active", self.units['suricata']],
                     capture_output=True, text=True, timeout=10
                 )
                 status = result.stdout.strip()
@@ -3653,7 +3694,7 @@ class SecurityControlPanel:
                 # Get uptime if running
                 if status == "active":
                     result = subprocess.run(
-                        ["systemctl", "show", "suricata-laptop", "--property=ActiveEnterTimestamp"],
+                        ["systemctl", "show", self.units['suricata'], "--property=ActiveEnterTimestamp"],
                         capture_output=True, text=True, timeout=10
                     )
                     if 'ActiveEnterTimestamp=' in result.stdout:
@@ -3700,7 +3741,7 @@ class SecurityControlPanel:
                 self._load_suricata_config_settings()
 
             except Exception as e:
-                print(f"Error loading Suricata settings: {e}")
+                logger.warning("Error loading Suricata settings: %s", e)
 
         threading.Thread(target=do_load, daemon=True).start()
 
@@ -3800,7 +3841,7 @@ class SecurityControlPanel:
                 foreground=self.colors['yellow']
             ))
         except Exception as e:
-            print(f"Error loading suricata config settings: {e}")
+            logger.warning("Error loading suricata config settings: %s", e)
             self.root.after(0, lambda: self.iface_status_label.configure(
                 text=f"Current config: error reading",
                 foreground=self.colors['red']
@@ -3858,12 +3899,13 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
                     temp_conf = f.name
 
                 # Batch all commands with single auth prompt
+                suri_unit = self.units['suricata']
                 result = run_privileged_batch([
-                    "mkdir -p /etc/systemd/system/suricata-laptop.service.d",
-                    f"cp {temp_conf} /etc/systemd/system/suricata-laptop.service.d/interface.conf",
-                    "chmod 644 /etc/systemd/system/suricata-laptop.service.d/interface.conf",
+                    f"mkdir -p /etc/systemd/system/{suri_unit}.service.d",
+                    f"cp {temp_conf} /etc/systemd/system/{suri_unit}.service.d/interface.conf",
+                    f"chmod 644 /etc/systemd/system/{suri_unit}.service.d/interface.conf",
                     "systemctl daemon-reload",
-                    "systemctl restart suricata-laptop",
+                    f"systemctl restart {suri_unit}",
                 ])
 
                 # Cleanup temp file
@@ -4388,7 +4430,7 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
                             self.iface_var.set(iface)
                             break
         except Exception as e:
-            print(f"Error detecting interfaces: {e}")
+            logger.warning("Error detecting interfaces: %s", e)
 
     def test_suricata_config(self):
         """Test the Suricata configuration for errors"""
@@ -4461,8 +4503,11 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
                 self.root.after(100, lambda: messagebox.showerror("Validation Error", err))
                 return
 
+            # Resolve to the unit name actually present on this host (the passed
+            # name is a distro-default; _resolve_unit maps it to the detected one).
+            unit = self._resolve_unit(service)
             result = subprocess.run(
-                ["pkexec", "systemctl", action, service],
+                ["pkexec", "systemctl", action, unit],
                 capture_output=True, text=True, timeout=30
             )
             # Refresh all status displays after service control
@@ -4529,7 +4574,7 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
                 self.root.after(0, lambda: self.sig_info_label.configure(text=sig_info))
 
             except Exception as e:
-                print(f"Error loading ClamAV settings: {e}")
+                logger.warning("Error loading ClamAV settings: %s", e)
 
         threading.Thread(target=do_load, daemon=True).start()
 
@@ -4595,26 +4640,31 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
                     f"chown {clam_user}:{clam_group} {quarantine_dir}",
                 ]
 
+                # Resolve unit names once (single source of truth for this host)
+                u_daemon = self.units['clamav_daemon']
+                u_fresh = self.units['clamav_freshclam']
+                u_onacc = self.units['clamav_clamonacc']
+
                 # Service persistence settings (enable/disable for boot)
                 if freshclam_persist:
-                    batch_commands.append("systemctl enable clamav-freshclam")
+                    batch_commands.append(f"systemctl enable {u_fresh}")
                 else:
-                    batch_commands.append("systemctl disable clamav-freshclam")
+                    batch_commands.append(f"systemctl disable {u_fresh}")
 
                 if onacc_persist:
-                    batch_commands.append("systemctl enable clamav-clamonacc")
+                    batch_commands.append(f"systemctl enable {u_onacc}")
                 else:
-                    batch_commands.append("systemctl disable clamav-clamonacc")
+                    batch_commands.append(f"systemctl disable {u_onacc}")
 
                 # Current session: start/stop on-access scanning
                 if onacc_enabled:
-                    batch_commands.append("systemctl start clamav-clamonacc")
+                    batch_commands.append(f"systemctl start {u_onacc}")
                 else:
-                    batch_commands.append("systemctl stop clamav-clamonacc")
+                    batch_commands.append(f"systemctl stop {u_onacc}")
 
                 # Always restart daemon and freshclam for current session
-                batch_commands.append("systemctl restart clamav-daemon")
-                batch_commands.append("systemctl restart clamav-freshclam")
+                batch_commands.append(f"systemctl restart {u_daemon}")
+                batch_commands.append(f"systemctl restart {u_fresh}")
 
                 # Execute all with single auth prompt
                 result = run_privileged_batch(batch_commands)
@@ -4681,7 +4731,7 @@ ExecStart=/usr/bin/suricata -c /etc/suricata/suricata.yaml -i {interface} --pidf
         # Try journalctl first (Fedora/systemd)
         try:
             result = subprocess.run(
-                ["journalctl", "-u", "clamav-freshclam", "--no-pager", "-n", "100"],
+                ["journalctl", "-u", self.units['clamav_freshclam'], "--no-pager", "-n", "100"],
                 capture_output=True, text=True, timeout=10
             )
             if result.stdout and result.stdout.strip():
@@ -4999,9 +5049,9 @@ StandardError=journal
                             elif key == 'auto_refresh':
                                 # Will be applied after widgets created
                                 self._saved_auto_refresh = value.lower() == 'true'
-                print(f"Loaded settings: retention={self.data_retention_minutes}min, refresh={self.refresh_interval}ms")
+                logger.info("Loaded settings: retention=%smin, refresh=%sms", self.data_retention_minutes, self.refresh_interval)
         except Exception as e:
-            print(f"Warning: Could not load settings: {e}")
+            logger.warning("Could not load settings: %s", e)
 
         # Load persistent filters
         filters_file = Path.home() / ".config" / "ids-suite" / "filters.json"
@@ -5016,9 +5066,9 @@ StandardError=journal
                     total = len(self.hidden_signatures) + len(self.hidden_src_ips) + \
                             len(self.hidden_dest_ips) + len(self.hidden_categories)
                     if total > 0:
-                        print(f"Loaded {total} persistent filters")
+                        logger.info("Loaded %s persistent filters", total)
         except Exception as e:
-            print(f"Warning: Could not load filters: {e}")
+            logger.warning("Could not load filters: %s", e)
 
     def save_shared_settings(self):
         """Save settings to shared config file for polybar and other tools"""
@@ -5031,7 +5081,7 @@ StandardError=journal
                 f.write(f"refresh_interval={self.refresh_interval // 1000}\n")
                 f.write(f"auto_refresh={self.auto_refresh.get()}\n")
         except Exception as e:
-            print(f"Warning: Could not save shared settings: {e}")
+            logger.warning("Could not save shared settings: %s", e)
 
     def save_filters(self):
         """Save persistent filters to JSON file"""
@@ -5048,7 +5098,7 @@ StandardError=journal
             with open(filters_file, 'w') as f:
                 json.dump(filters, f, indent=2)
         except Exception as e:
-            print(f"Warning: Could not save filters: {e}")
+            logger.warning("Could not save filters: %s", e)
 
     def purge_expired_cache_entries(self):
         """Remove entries older than the retention period from all caches"""
@@ -5303,51 +5353,126 @@ For issues or suggestions, see the project repository.
     # All status checks should use these methods to ensure consistency
     # ========================================================================
 
+    # Candidate systemd unit names per logical service. Distros/setups differ;
+    # the first entry that is loaded/active on the host is used.
+    _UNIT_CANDIDATES = {
+        'suricata': ['suricata-laptop', 'suricata'],
+        'clamav_daemon': ['clamav-daemon', 'clamd@scan', 'clamd'],
+        'clamav_freshclam': ['clamav-freshclam', 'freshclam'],
+        'clamav_clamonacc': ['clamav-clamonacc', 'clamonacc'],
+    }
+
+    def _detect_service_units(self):
+        """Detect the real systemd unit name for each logical service.
+
+        For each service we probe the candidate unit names and pick the one that
+        is active; failing that, the first one that is loaded (exists); failing
+        that, the first candidate as a stable default. Run once at startup so
+        the whole app has ONE source of truth for unit names.
+        """
+        units = {}
+        for logical, candidates in self._UNIT_CANDIDATES.items():
+            chosen = None
+            first_loaded = None
+            for cand in candidates:
+                try:
+                    active = subprocess.run(
+                        ["systemctl", "is-active", cand],
+                        capture_output=True, text=True, timeout=3
+                    ).stdout.strip()
+                    load_state = subprocess.run(
+                        ["systemctl", "show", "-p", "LoadState", "--value", cand],
+                        capture_output=True, text=True, timeout=3
+                    ).stdout.strip()
+                except Exception as e:
+                    logger.debug("Unit probe failed for %s: %s", cand, e)
+                    continue
+                if active == 'active':
+                    chosen = cand
+                    break
+                if load_state == 'loaded' and first_loaded is None:
+                    first_loaded = cand
+            units[logical] = chosen or first_loaded or candidates[0]
+        logger.info("Detected service units: %s", units)
+        return units
+
+    def _resolve_unit(self, name):
+        """Map a distro-default unit name to the one detected on this host.
+
+        Single source of truth for unit names: any control path that has a
+        hard-coded default name can route it through here to hit the unit that
+        actually exists. Falls back to the given name if it isn't recognized.
+        """
+        for logical, candidates in self._UNIT_CANDIDATES.items():
+            if name in candidates:
+                return self.units.get(logical, name)
+        return name
+
+    @staticmethod
+    def _parse_eve_timestamp(ts):
+        """Parse a Suricata EVE ISO-8601 timestamp to a tz-aware UTC datetime.
+
+        Suricata emits e.g. ``2026-07-17T12:34:56.789012-0400`` (or ``...Z``).
+        Python 3.10's ``fromisoformat`` can't parse the ``-0400`` (colon-less)
+        offset, so use ``strptime`` with ``%z`` and fall back gracefully.
+        Returns ``None`` if unparseable.
+        """
+        if not ts:
+            return None
+        for fmt in ('%Y-%m-%dT%H:%M:%S.%f%z', '%Y-%m-%dT%H:%M:%S%z'):
+            try:
+                return datetime.strptime(ts, fmt).astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                continue
+        # Offset-less fallback: assume local time, normalize to UTC.
+        for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.strptime(ts[:26], fmt).astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                continue
+        return None
+
     def _refresh_service_status_cache(self):
         """Refresh the centralized service status cache.
 
         This is the SINGLE function that queries systemctl for all services.
         All other status-related methods should read from the cache, not call
         systemctl directly. This ensures consistent status across all tabs.
+
+        Uses the auto-detected unit names and queries ``is-enabled`` per-unit
+        (a single batched ``is-enabled`` can drop lines for masked/transient
+        units and misalign the results — see MED-3).
         """
-        services = ['suricata-laptop', 'clamav-daemon', 'clamav-freshclam', 'clamav-clamonacc']
+        logical_order = ['suricata', 'clamav_daemon', 'clamav_freshclam', 'clamav_clamonacc']
 
         try:
-            # Get active status for all services in one call
-            result = subprocess.run(
-                ["systemctl", "is-active"] + services,
-                capture_output=True, text=True, timeout=5
-            )
-            active_statuses = result.stdout.strip().split('\n')
-
-            # Get enabled status for all services in one call
-            result_enabled = subprocess.run(
-                ["systemctl", "is-enabled"] + services,
-                capture_output=True, text=True, timeout=5
-            )
-            enabled_statuses = result_enabled.stdout.strip().split('\n')
-
-            # Update cache with both active and enabled states
-            self._service_status_cache['suricata'] = {
-                'active': active_statuses[0] == 'active' if len(active_statuses) > 0 else False,
-                'enabled': enabled_statuses[0] == 'enabled' if len(enabled_statuses) > 0 else False
-            }
-            self._service_status_cache['clamav_daemon'] = {
-                'active': active_statuses[1] == 'active' if len(active_statuses) > 1 else False,
-                'enabled': enabled_statuses[1] == 'enabled' if len(enabled_statuses) > 1 else False
-            }
-            self._service_status_cache['clamav_freshclam'] = {
-                'active': active_statuses[2] == 'active' if len(active_statuses) > 2 else False,
-                'enabled': enabled_statuses[2] == 'enabled' if len(enabled_statuses) > 2 else False
-            }
-            self._service_status_cache['clamav_clamonacc'] = {
-                'active': active_statuses[3] == 'active' if len(active_statuses) > 3 else False,
-                'enabled': enabled_statuses[3] == 'enabled' if len(enabled_statuses) > 3 else False
-            }
+            for logical in logical_order:
+                unit = self.units.get(logical, logical)
+                try:
+                    active = subprocess.run(
+                        ["systemctl", "is-active", unit],
+                        capture_output=True, text=True, timeout=5
+                    ).stdout.strip()
+                except Exception as e:
+                    logger.warning("is-active failed for %s: %s", unit, e)
+                    active = ''
+                try:
+                    enabled = subprocess.run(
+                        ["systemctl", "is-enabled", unit],
+                        capture_output=True, text=True, timeout=5
+                    ).stdout.strip()
+                except Exception as e:
+                    logger.warning("is-enabled failed for %s: %s", unit, e)
+                    enabled = ''
+                self._service_status_cache[logical] = {
+                    'active': active == 'active',
+                    # "on at boot" — 'enabled' plus the runtime-enabled variant
+                    'enabled': enabled in ('enabled', 'enabled-runtime'),
+                }
             self._service_status_cache['last_update'] = datetime.now()
 
         except Exception as e:
-            print(f"Error refreshing service status cache: {e}")
+            logger.warning("Error refreshing service status cache: %s", e, exc_info=True)
             # Keep existing cache values on error
 
     def get_all_service_status(self):
@@ -5395,11 +5520,26 @@ For issues or suggestions, see the project repository.
 
         This is the SINGLE function that should be called when service status
         changes. It updates the cache and then updates all UI elements.
-        """
-        # First, refresh the cache
-        self._refresh_service_status_cache()
 
-        # Now update all UI components using the cache
+        NOTE: This performs subprocess I/O (the cache refresh) followed by
+        widget mutation, so it MUST be called on the main thread. The periodic
+        auto-refresh path gathers the cache off-thread and then calls
+        ``_apply_status_ui`` directly on the main thread instead.
+        """
+        # First, refresh the cache (subprocess I/O)
+        self._refresh_service_status_cache()
+        # Then apply the cached values to the widgets (main thread only)
+        self._apply_status_ui()
+
+    def _apply_status_ui(self):
+        """Apply the cached service status to all widgets.
+
+        Pure widget mutation — reads only from ``_service_status_cache`` and
+        MUST run on the main (Tk) thread. Split out of ``refresh_status`` so the
+        auto-refresh worker can gather the cache off-thread and marshal just
+        this UI step back via ``root.after``.
+        """
+        # Update all UI components using the cache
         statuses = self.get_all_service_status()
 
         # === TOP BAR: Suricata status icon and buttons ===
@@ -5483,32 +5623,52 @@ For issues or suggestions, see the project repository.
             else:
                 lines = self.eve_reader.read_new_lines(5000)
 
-            # Parse all events and add to buffer (store raw JSON dict)
+            # Parse all events and add to buffer (store raw JSON dict + parsed
+            # tz-aware datetime so retention pruning doesn't re-parse each cycle)
             for line in lines:
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
-                    timestamp = data.get('timestamp', '')[:19]
+                    full_ts = data.get('timestamp', '')
                     self.eve_event_buffer.append({
-                        'timestamp': timestamp,
+                        'timestamp': full_ts[:19],
+                        'dt': self._parse_eve_timestamp(full_ts),
                         'data': data  # Full parsed JSON
                     })
                 except json.JSONDecodeError:
                     continue
 
-            # Prune buffer by retention
-            retention_cutoff = datetime.now() - timedelta(minutes=self.data_retention_minutes)
-            cutoff_str = retention_cutoff.strftime('%Y-%m-%dT%H:%M:%S')
-            self.eve_event_buffer = [
-                e for e in self.eve_event_buffer
-                if e['timestamp'] >= cutoff_str
-            ]
+            # Prune buffer by retention — measured from the NEWEST event we have,
+            # NOT wall-clock now(). Otherwise a stopped/quiet sensor (or a host
+            # whose clock/timezone differs from Suricata's log timezone) prunes
+            # the whole buffer to empty and the live view silently goes blank.
+            events_with_dt = [e for e in self.eve_event_buffer if e.get('dt') is not None]
+            if events_with_dt:
+                newest_dt = max(e['dt'] for e in events_with_dt)
+                cutoff_dt = newest_dt - timedelta(minutes=self.data_retention_minutes)
+                # Keep events within the window; keep undated events too rather
+                # than silently dropping them.
+                self.eve_event_buffer = [
+                    e for e in self.eve_event_buffer
+                    if e.get('dt') is None or e['dt'] >= cutoff_dt
+                ]
+
+            # Hard size cap as a memory backstop (keeps the newest events).
+            if len(self.eve_event_buffer) > self.MAX_EVENT_BUFFER:
+                self.eve_event_buffer = self.eve_event_buffer[-self.MAX_EVENT_BUFFER:]
+
+            # Surface any reader-level error (permission/IO) so the UI can tell
+            # the user *why* it's empty instead of showing a silent blank grid.
+            try:
+                self._eve_health_msg = self.eve_reader.get_last_error()
+            except Exception:
+                self._eve_health_msg = None
 
             self.eve_buffer_last_update = datetime.now()
 
         except Exception as e:
-            print(f"Error updating EVE buffer: {e}")
+            logger.warning("Error updating EVE buffer: %s", e, exc_info=True)
 
     def refresh_stats(self):
         """Refresh stats from shared EVE buffer"""
@@ -5602,6 +5762,16 @@ For issues or suggestions, see the project repository.
         # Update the shared buffer first
         self._update_eve_buffer()
 
+        # Surface any EVE read problem (permission/IO) so an empty grid isn't
+        # silently ambiguous with "no alerts" (CRIT-2).
+        try:
+            if getattr(self, '_eve_health_msg', None):
+                self.eve_health_label.configure(text=f"⚠ {self._eve_health_msg}")
+            else:
+                self.eve_health_label.configure(text="")
+        except (AttributeError, tk.TclError):
+            pass
+
         severity_filter = self.severity_var.get()
         date_from = self.date_from_var.get().strip()
         date_to = self.date_to_var.get().strip()
@@ -5624,10 +5794,14 @@ For issues or suggestions, see the project repository.
             if engine_filter != "all" and engine_filter != "suricata":
                 continue
 
-            # Severity filter
+            # Severity filter (combobox is readonly, but guard the parse anyway
+            # so a stray value can never kill the whole refresh cycle)
             if severity_filter != "all":
-                filter_sev = int(severity_filter[0])
-                if severity != filter_sev:
+                try:
+                    filter_sev = int(severity_filter[0])
+                except (ValueError, IndexError):
+                    filter_sev = None
+                if filter_sev is not None and severity != filter_sev:
                     continue
 
             # Date range filter
@@ -5665,8 +5839,9 @@ For issues or suggestions, see the project repository.
         # Group similar alerts by signature (before limiting)
         new_alerts_data = self._group_alerts_by_signature(new_alerts_data)
 
-        # Limit to last 200 grouped alerts
-        new_alerts_data = new_alerts_data[-200:]
+        # Keep the NEWEST 200 grouped alerts. _group_alerts_by_signature returns
+        # newest-first, so slice the head; [-200:] would keep the OLDEST 200.
+        new_alerts_data = new_alerts_data[:200]
 
         # Apply threat intel status for all alerts (check both src and dst IPs)
         for alert in new_alerts_data:
@@ -5988,7 +6163,7 @@ For issues or suggestions, see the project repository.
                                 continue
 
                     except Exception as e:
-                        print(f"Error reading {log_file}: {e}")
+                        logger.warning("Error reading %s: %s", log_file, e)
                         continue
 
                 # Sort by timestamp (newest first)
@@ -6355,7 +6530,7 @@ For issues or suggestions, see the project repository.
                 self.root.after(100, update_ui)
 
             except Exception as e:
-                print(f"Auto-lookup error for {ip}: {e}")
+                logger.warning("Auto-lookup error for %s: %s", ip, e)
                 self.ip_tracker.record_lookup(ip, 'error', source='AbuseIPDB',
                                               details={'error': str(e)})
 
@@ -7497,8 +7672,47 @@ For issues or suggestions, see the project repository.
                                    command=popup.destroy).pack(pady=10)
 
     def refresh_all(self):
-        def do_refresh():
-            self.refresh_status()
+        """Periodic auto-refresh.
+
+        Tcl/Tk is NOT thread-safe: mutating widgets from a background thread
+        causes intermittent corruption, no-op updates and crashes. So we do all
+        the slow I/O (EVE file read + systemctl subprocesses) on a worker thread
+        and then marshal every widget mutation back onto the main thread via
+        ``root.after``.
+        """
+        # Prevent overlapping refresh workers piling up: the systemctl calls can
+        # take up to several seconds (5s timeout each) which can exceed the 5s
+        # tick. If a gather is still running, skip this tick.
+        if getattr(self, '_refresh_in_progress', False):
+            return
+        self._refresh_in_progress = True
+
+        def gather_and_apply():
+            try:
+                # --- I/O ONLY: safe to run off the main thread ---
+                self._update_eve_buffer()             # file read + buffer update
+                self._refresh_service_status_cache()  # systemctl subprocesses
+            except Exception as e:
+                logger.warning("Auto-refresh gather failed: %s", e, exc_info=True)
+            # --- Marshal ALL widget mutation back onto the main thread ---
+            try:
+                self.root.after(0, self._apply_refresh_ui)
+            except Exception:
+                # root may already be torn down during shutdown
+                self._refresh_in_progress = False
+
+        threading.Thread(target=gather_and_apply, daemon=True).start()
+
+    def _apply_refresh_ui(self):
+        """Apply refreshed data to widgets. MUST run on the main (Tk) thread.
+
+        The heavy I/O has already been done by the worker in ``refresh_all``;
+        the ``refresh_*`` methods below only transform the in-memory buffer and
+        cache into widget state (the redundant incremental ``_update_eve_buffer``
+        calls inside them are near-free after the worker advanced the reader).
+        """
+        try:
+            self._apply_status_ui()
             self.refresh_stats()
             self.refresh_activity()
             self.refresh_clamav_stats()
@@ -7517,8 +7731,10 @@ For issues or suggestions, see the project repository.
                 self.refresh_clamav_overview()
             elif current == 6:
                 self.refresh_quarantine()
-
-        threading.Thread(target=do_refresh, daemon=True).start()
+        except Exception as e:
+            logger.warning("Auto-refresh UI apply failed: %s", e, exc_info=True)
+        finally:
+            self._refresh_in_progress = False
 
     def _initial_data_load(self):
         """Perform initial data load for all tabs on startup.
@@ -7528,13 +7744,20 @@ For issues or suggestions, see the project repository.
         """
         def do_initial_load():
             try:
+                # Refine systemd unit names off the main thread (probes systemctl;
+                # __init__ seeded fast defaults so the window already painted).
+                try:
+                    self.units = self._detect_service_units()
+                except Exception as e:
+                    logger.warning("Service unit detection failed: %s", e, exc_info=True)
+
                 # Load EVE buffer first (this populates the shared data)
                 self._update_eve_buffer()
 
                 # Schedule UI updates on main thread
                 self.root.after(0, self._populate_initial_tabs)
             except Exception as e:
-                print(f"Initial data load error: {e}")
+                logger.warning("Initial data load error: %s", e, exc_info=True)
 
         threading.Thread(target=do_initial_load, daemon=True).start()
 
@@ -7575,7 +7798,7 @@ For issues or suggestions, see the project repository.
             self.refresh_firewall()
 
         except Exception as e:
-            print(f"Error populating initial tabs: {e}")
+            logger.warning("Error populating initial tabs: %s", e)
 
     def start_auto_refresh(self):
         if self.auto_refresh.get():
@@ -7585,7 +7808,7 @@ For issues or suggestions, see the project repository.
     # Suricata control methods
     def start_ids(self):
         def do_start():
-            result = subprocess.run(["pkexec", "systemctl", "start", "suricata-laptop"],
+            result = subprocess.run(["pkexec", "systemctl", "start", self.units['suricata']],
                                    capture_output=True, text=True, timeout=30)
             self.root.after(100, self.refresh_status)
             if result.returncode == 0:
@@ -7597,7 +7820,7 @@ For issues or suggestions, see the project repository.
 
     def stop_ids(self):
         def do_stop():
-            result = subprocess.run(["pkexec", "systemctl", "stop", "suricata-laptop"],
+            result = subprocess.run(["pkexec", "systemctl", "stop", self.units['suricata']],
                                    capture_output=True, text=True, timeout=30)
             self.root.after(100, self.refresh_status)
             if result.returncode == 0:
@@ -7635,9 +7858,9 @@ For issues or suggestions, see the project repository.
         def do_start():
             # Single auth prompt for all 3 services
             result = run_privileged_batch([
-                "systemctl start clamav-daemon",
-                "systemctl start clamav-freshclam",
-                "systemctl start clamav-clamonacc",
+                f"systemctl start {self.units['clamav_daemon']}",
+                f"systemctl start {self.units['clamav_freshclam']}",
+                f"systemctl start {self.units['clamav_clamonacc']}",
             ])
             self.root.after(100, self.refresh_status)
             self.root.after(200, self.refresh_clamav_stats)  # Update top stats bar
@@ -7652,9 +7875,9 @@ For issues or suggestions, see the project repository.
         def do_stop():
             # Single auth prompt for all 3 services (reverse order)
             result = run_privileged_batch([
-                "systemctl stop clamav-clamonacc",
-                "systemctl stop clamav-freshclam",
-                "systemctl stop clamav-daemon",
+                f"systemctl stop {self.units['clamav_clamonacc']}",
+                f"systemctl stop {self.units['clamav_freshclam']}",
+                f"systemctl stop {self.units['clamav_daemon']}",
             ])
             self.root.after(100, self.refresh_status)
             self.root.after(200, self.refresh_clamav_stats)  # Update top stats bar
@@ -7673,9 +7896,9 @@ For issues or suggestions, see the project repository.
             try:
                 # Single auth prompt: stop freshclam, update, restart
                 result = run_privileged_batch([
-                    "systemctl stop clamav-freshclam",
+                    f"systemctl stop {self.units['clamav_freshclam']}",
                     "freshclam",
-                    "systemctl start clamav-freshclam",
+                    f"systemctl start {self.units['clamav_freshclam']}",
                 ])
 
                 def show_result():
@@ -7728,8 +7951,11 @@ For issues or suggestions, see the project repository.
         This function only updates signature count and quarantine count.
         """
         try:
-            # Service status is now handled by refresh_status() - just refresh cache and update
-            self.refresh_status()
+            # Service status (daemon/freshclam/onaccess ON/OFF widgets) is applied
+            # by refresh_status()/_apply_status_ui(), which every caller of this
+            # method already invokes separately. Calling refresh_status() here too
+            # would re-run 8 systemctl subprocesses on the main thread each cycle
+            # (jank + redundant with the off-thread gather in refresh_all).
 
             # Signature count - check both .cvd and .cld files
             sig_count = "N/A"
@@ -7774,7 +8000,7 @@ For issues or suggestions, see the project repository.
             )
 
         except Exception as e:
-            print(f"Error refreshing ClamAV stats: {e}")
+            logger.warning("Error refreshing ClamAV stats: %s", e)
 
     def refresh_clamav_overview(self):
         try:
@@ -7990,7 +8216,7 @@ For issues or suggestions, see the project repository.
                         break
 
         except Exception as e:
-            print(f"Error refreshing quarantine: {e}")
+            logger.warning("Error refreshing quarantine: %s", e)
 
     def sort_quarantine(self, column):
         """Sort quarantine by column"""

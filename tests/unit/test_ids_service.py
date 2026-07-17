@@ -176,7 +176,9 @@ class TestIDSServiceUpdateRules:
             assert r.success is True
 
         svc.update_rules(callback=callback)
-        mock_cmd.assert_called_once_with("suricata-update --no-test")
+        # MED-2 fix: run_privileged_command (systemd.py) requires a list of
+        # argv, not a shell-style string.
+        mock_cmd.assert_called_once_with(["suricata-update", "--no-test"])
         assert callback_called
 
     def test_update_rules_snort(self):
@@ -219,7 +221,8 @@ class TestIDSServiceReloadRules:
             callback_result = r
 
         svc.reload_rules(callback=callback)
-        mock_cmd.assert_called_once_with("suricatasc -c reload-rules")
+        # MED-2 fix: run_privileged_command requires a list of argv.
+        mock_cmd.assert_called_once_with(["suricatasc", "-c", "reload-rules"])
         assert callback_result.success is True
 
     @patch('ids_suite.services.systemd.SystemdService.reload')
@@ -331,7 +334,8 @@ class TestIDSServiceCleanLogs:
             callback_result = r
 
         svc.clean_logs(callback=callback)
-        mock_cmd.assert_called_once_with("/usr/local/bin/ids-cleanup")
+        # MED-2 fix: run_privileged_command requires a list of argv.
+        mock_cmd.assert_called_once_with(["/usr/local/bin/ids-cleanup"])
         assert callback_result.success is True
 
     @patch('ids_suite.services.ids_service.run_privileged_command')

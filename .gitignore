@@ -110,3 +110,4 @@ temp/
 *.db
 *.sqlite
 *.sqlite3
+docs/security/

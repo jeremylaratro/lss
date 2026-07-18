@@ -226,7 +226,7 @@ class DNSTab(BaseTab):
         if selected:
             try:
                 selected_values = self.tree.item(selected[0], 'values')
-            except:
+            except Exception:
                 pass
 
         # Clear and repopulate treeview
@@ -258,7 +258,7 @@ class DNSTab(BaseTab):
         if selected_values:
             for item in self.tree.get_children():
                 if self.tree.item(item, 'values') == selected_values:
-                    self.tree.selection_set(item)
+                    self.tree.treeview.selection_set(item)
                     break
 
     def _sort_by_column(self, column: str) -> None:
@@ -330,7 +330,7 @@ class DNSTab(BaseTab):
         if not item:
             return
 
-        self.tree.selection_set(item)
+        self.tree.treeview.selection_set(item)
         values = self.tree.item(item, 'values')
         domain = values[2]
         source_ip = values[5]

@@ -261,7 +261,7 @@ class QuarantineTab(BaseTab):
             ["pkexec", "/usr/local/bin/av-cleanup"],
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=30
         )
 
         messagebox.showinfo("Cleanup", result.stdout or "Quarantine cleaned")

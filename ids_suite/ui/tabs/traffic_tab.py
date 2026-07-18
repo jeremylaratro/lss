@@ -253,7 +253,7 @@ class TrafficTab(BaseTab):
         if selected:
             try:
                 selected_values = self.traffic_tree.item(selected[0], 'values')
-            except:
+            except Exception:
                 pass
 
         # Clear and repopulate treeview
@@ -280,7 +280,7 @@ class TrafficTab(BaseTab):
         if selected_values:
             for item in self.traffic_tree.get_children():
                 if self.traffic_tree.item(item, 'values') == selected_values:
-                    self.traffic_tree.selection_set(item)
+                    self.traffic_tree.treeview.selection_set(item)
                     break
 
     def sort_traffic(self, column: str) -> None:
@@ -344,6 +344,9 @@ class TrafficTab(BaseTab):
 
             grouped_entries.append(most_recent)
 
+        # Sort grouped entries by timestamp (most recent first)
+        grouped_entries.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+
         return grouped_entries
 
     def _show_traffic_context_menu(self, event) -> None:
@@ -352,7 +355,7 @@ class TrafficTab(BaseTab):
         if not item:
             return
 
-        self.traffic_tree.selection_set(item)
+        self.traffic_tree.treeview.selection_set(item)
         values = self.traffic_tree.item(item, 'values')
         host = values[4]
         dest = values[3].split(':')[0] if ':' in values[3] else values[3]

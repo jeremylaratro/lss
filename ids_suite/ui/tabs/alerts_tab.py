@@ -119,17 +119,24 @@ class AlertsTab(BaseTab):
         )
         self.time_range_status.pack(side=tk.LEFT, padx=(15, 0))
 
+        # Health banner: surfaces WHY the alerts view is empty (e.g. the EVE log
+        # can't be read) instead of showing a silent blank grid (CRIT-2).
+        self.eve_health_label = ttk.Label(
+            time_frame, text="", foreground=self.get_colors()['red']
+        )
+        self.eve_health_label.pack(side=tk.LEFT, padx=(15, 0))
+
         # Filter frame
         filter_frame = ttk.Frame(self.frame)
         filter_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Engine filter (Suricata/Snort/Both)
+        # Engine filter. NOTE: this view is backed by Suricata's eve.json only,
+        # so we deliberately do NOT offer "Snort" here — selecting it would
+        # silently filter out every event and show an empty grid (MED-5).
         factory.create_label(filter_frame, text="Engine:").pack(side=tk.LEFT, padx=(0, 5))
         engine_values = ["All"]
         if self.app.suricata_engine.is_installed():
             engine_values.append("Suricata")
-        if self.app.snort_engine.is_installed():
-            engine_values.append("Snort")
         engine_combo = ttk.Combobox(
             filter_frame,
             textvariable=self.engine_filter,
@@ -145,7 +152,8 @@ class AlertsTab(BaseTab):
             filter_frame,
             textvariable=self.severity_var,
             values=["all", "1 - High", "2 - Medium", "3 - Low"],
-            width=15
+            width=15,
+            state='readonly'
         )
         severity_combo.pack(side=tk.LEFT, padx=(0, 15))
         severity_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh())
@@ -223,6 +231,40 @@ class AlertsTab(BaseTab):
         # Pack the tree frame
         tree_wrapper.frame.pack(fill=tk.BOTH, expand=True)
 
+        # Auto-resize flexible columns when the tab is resized (parity with the
+        # original inline implementation).
+        tree_wrapper.frame.bind('<Configure>', self._on_alerts_tree_resize)
+
+    def _on_alerts_tree_resize(self, event) -> None:
+        """Debounced auto-resize of alerts columns on window resize."""
+        if getattr(self, '_resize_after_id', None) is not None:
+            try:
+                self.app.root.after_cancel(self._resize_after_id)
+            except Exception:
+                pass
+        self._resize_after_id = self.app.root.after(
+            100, lambda: self._do_alerts_resize(event.width)
+        )
+
+    def _do_alerts_resize(self, total_width) -> None:
+        """Perform the actual column resize calculation."""
+        if total_width < 100:
+            return  # Ignore invalid widths
+
+        # Fixed-width columns (don't scale)
+        fixed_cols = {'timestamp': 70, 'sev': 35, 'category': 50, 'intel': 90}
+        fixed_total = sum(fixed_cols.values())
+
+        # Remaining width for flexible columns (signature, source, destination)
+        remaining = total_width - fixed_total - 20  # 20px for scrollbar
+
+        if remaining > 0:
+            sig_width = max(150, int(remaining * 0.50))
+            ip_width = max(90, int(remaining * 0.25))
+            self.alerts_tree.column('signature', width=sig_width)
+            self.alerts_tree.column('source', width=ip_width)
+            self.alerts_tree.column('destination', width=ip_width)
+
     def _format_alert_timestamp(self, timestamp: str) -> str:
         """Format timestamp for display - compact for recent, full for older."""
         if not timestamp or len(timestamp) < 19:
@@ -244,6 +286,16 @@ class AlertsTab(BaseTab):
 
         # Update the shared buffer first
         self.app._update_eve_buffer()
+
+        # Surface any EVE read problem (permission/IO) so an empty grid isn't
+        # silently ambiguous with "no alerts" (CRIT-2).
+        try:
+            if getattr(self.app, '_eve_health_msg', None):
+                self.eve_health_label.configure(text=f"⚠ {self.app._eve_health_msg}")
+            else:
+                self.eve_health_label.configure(text="")
+        except (AttributeError, tk.TclError):
+            pass
 
         severity_filter = self.severity_var.get()
         date_from = self.date_from_var.get().strip()
@@ -267,10 +319,14 @@ class AlertsTab(BaseTab):
             if engine_filter != "all" and engine_filter != "suricata":
                 continue
 
-            # Severity filter
+            # Severity filter (combobox is readonly, but guard the parse anyway
+            # so a stray value can never kill the whole refresh cycle)
             if severity_filter != "all":
-                filter_sev = int(severity_filter[0])
-                if severity != filter_sev:
+                try:
+                    filter_sev = int(severity_filter[0])
+                except (ValueError, IndexError):
+                    filter_sev = None
+                if filter_sev is not None and severity != filter_sev:
                     continue
 
             # Date range filter
@@ -310,8 +366,9 @@ class AlertsTab(BaseTab):
         # Group similar alerts by signature (before limiting)
         new_alerts_data = self._group_alerts_by_signature(new_alerts_data)
 
-        # Limit to last 200 grouped alerts
-        new_alerts_data = new_alerts_data[-200:]
+        # Keep the NEWEST 200 grouped alerts. _group_alerts_by_signature returns
+        # newest-first, so slice the head; [-200:] would keep the OLDEST 200 (HIGH-4).
+        new_alerts_data = new_alerts_data[:200]
 
         # Apply threat intel status for all alerts (check both src and dst IPs)
         for alert in new_alerts_data:
@@ -378,7 +435,7 @@ class AlertsTab(BaseTab):
         if selected:
             try:
                 selected_values = self.alerts_tree.item(selected[0], 'values')
-            except:
+            except Exception:
                 pass
 
         # Clear and repopulate
@@ -394,7 +451,9 @@ class AlertsTab(BaseTab):
 
             self.alerts_tree.insert('', 0, values=(
                 self._format_alert_timestamp(alert['timestamp']),
-                sev,
+                # store severity as str to match the change-detection tuple
+                # (new_values uses str(sev)); Tk stores values as strings anyway (LOW-4)
+                str(sev),
                 alert['signature'],
                 alert['source'],
                 alert['destination'],
@@ -421,6 +480,22 @@ class AlertsTab(BaseTab):
             self.alerts_sort_reverse = True
 
         self.refresh()
+
+    def filter_alerts_treeview(self, search_text: str) -> None:
+        """Filter the alerts treeview by search text (global search-bar hook).
+
+        Detaches non-matching rows; an empty search restores the full view.
+        """
+        if not search_text:
+            # Show all - just refresh
+            self.refresh()
+            return
+
+        for item in self.alerts_tree.get_children():
+            values = self.alerts_tree.item(item, 'values')
+            match = any(search_text in str(v).lower() for v in values)
+            if not match:
+                self.alerts_tree.detach(item)
 
     def _set_time_range(self, preset: str) -> None:
         """Set time range preset and load appropriate data"""
@@ -721,7 +796,7 @@ class AlertsTab(BaseTab):
         if selected:
             try:
                 selected_values = self.alerts_tree.item(selected[0], 'values')
-            except:
+            except Exception:
                 pass
 
         # Clear and repopulate
@@ -736,7 +811,7 @@ class AlertsTab(BaseTab):
             cat = alert['category']
             self.alerts_tree.insert('', tk.END, values=(
                 self._format_alert_timestamp(alert['timestamp']),
-                sev,
+                str(sev),
                 alert['signature'],
                 alert['source'],
                 alert['destination'],
@@ -765,17 +840,21 @@ class AlertsTab(BaseTab):
         # Columns: timestamp, sev, signature, source, destination, category, intel
         display_ts, sev, signature, source, destination = values[0], values[1], values[2], values[3], values[4]
 
+        # Strip x{count} suffix from grouped signatures for matching
+        base_signature = re.sub(r'\s+x\d+$', '', signature)
+
         # Find the full alert data by matching signature and source
         alert_data = None
         alert_obj = None
         for alert in self.alerts_data:
-            if alert['signature'] == signature and alert['source'] == source:
+            alert_sig = re.sub(r'\s+x\d+$', '', alert.get('signature', ''))
+            if alert_sig == base_signature and alert['source'] == source:
                 if str(alert['severity']) == str(sev):
                     alert_data = alert.get('raw_data', {})
                     alert_obj = alert
                     break
 
-        if not alert_data:
+        if not alert_obj:
             return
 
         # Create popup window
@@ -802,7 +881,7 @@ class AlertsTab(BaseTab):
         ).pack(side=tk.LEFT)
         tk.Label(
             header_frame,
-            text=timestamp,
+            text=display_ts,
             font=('Hack Nerd Font', 10),
             bg=colors['bg'],
             fg=colors['gray']
@@ -838,7 +917,7 @@ class AlertsTab(BaseTab):
             font=('Hack Nerd Font', 9)
         )
         json_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        json_text.insert(tk.END, json.dumps(alert_data, indent=2))
+        json_text.insert(tk.END, json.dumps(alert_data or {}, indent=2))
         json_text.configure(state='disabled')
 
     def _show_alert_context_menu(self, event) -> None:
